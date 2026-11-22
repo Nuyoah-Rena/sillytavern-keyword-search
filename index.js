@@ -1652,24 +1652,268 @@ async function jumpWorldInfo(book, uid) {
     }, 180);
 }
 
-// 在提示词管理器列表里按 identifier 精确找条目（避开选择器转义问题）
+/* ---------- 预设增强跳转：联动柏宝箱分组筛选 + 退出编辑框精准高亮 + 编辑框关键词定位 ---------- */
+let kwPresetPopupWatcher = null;
+
+function ensurePresetEnhanceStyle() {
+    ensureWiEnhanceStyle();
+    if (document.getElementById('kwsearch-preset-enhance-style')) return;
+    const style = document.createElement('style');
+    style.id = 'kwsearch-preset-enhance-style';
+    style.textContent = `
+        @keyframes kwsearchPresetPulse {
+            0%, 100% {
+                box-shadow: inset 0 0 0 2px var(--kw-wi-accent),
+                            0 0 12px color-mix(in srgb, var(--kw-wi-accent) 45%, transparent);
+            }
+            50% {
+                box-shadow: inset 0 0 0 3px var(--kw-wi-accent),
+                            0 0 22px color-mix(in srgb, var(--kw-wi-accent) 78%, transparent);
+            }
+        }
+        .kwsearch-preset-pinned {
+            box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--kw-wi-accent) 85%, transparent) !important;
+            background-color: color-mix(in srgb, var(--kw-wi-accent) 16%, transparent) !important;
+            border-radius: 8px !important;
+        }
+        .kwsearch-preset-flash {
+            animation: kwsearchPresetPulse 1.05s ease-in-out 4 !important;
+        }
+    `;
+    document.head.appendChild(style);
+}
+
+// 在提示词管理器列表里按 identifier 精确找条目（优先避开柏宝箱顶部的收藏镜像）
 function findPresetItem(identifier) {
     const list = document.getElementById('completion_prompt_manager_list');
-    if (!list) return null;
-    return Array.from(list.querySelectorAll('[data-pm-identifier]'))
-        .find(el => el.getAttribute('data-pm-identifier') === identifier) || null;
+    if (!list || identifier == null) return null;
+    const matches = Array.from(list.querySelectorAll('[data-pm-identifier]'))
+        .filter(el => el.getAttribute('data-pm-identifier') === identifier);
+    return matches.find(el => !el.hasAttribute('data-preset-favorite-mirror')) || matches[0] || null;
+}
+
+// 计算填入柏宝箱搜索框的筛选词（优先条目名，确保精准筛出该条目及所在分组）
+function getPresetFilterText(target, fallbackName) {
+    const nm = `${(target && target.name) || fallbackName || ''}`.trim();
+    if (nm) return nm;
+    if (kwLastQuery && !(kwLastOpts && kwLastOpts.regex)) return kwLastQuery.trim();
+    const content = `${(target && target.content) || ''}`;
+    if (!content) return '';
+    try {
+        if (kwLastQuery) {
+            const re = buildRegex(kwLastQuery, kwLastOpts || {});
+            re.lastIndex = 0;
+            const hit = re.exec(content);
+            if (hit) {
+                const piece = content.slice(Math.max(0, hit.index - 6), Math.min(content.length, hit.index + hit[0].length + 12))
+                    .replace(/\s+/g, ' ').trim();
+                if (piece) return piece;
+            }
+        }
+    } catch (e) { /* ignore */ }
+    return content.replace(/\s+/g, ' ').trim().slice(0, 20);
+}
+
+// 自动调用柏宝箱的预设搜索栏筛选出目标条目与所在分组（不写回折叠状态，可一键还原）
+async function applyBaibaiPresetFilter(filterText) {
+    if (!filterText) return false;
+    const toggle = document.querySelector('#completion_prompt_manager_list .bai-bai-preset-search-toggle')
+        || document.querySelector('.bai-bai-preset-search-toggle');
+    if (!toggle) return false;
+
+    if (!toggle.classList.contains('bai-bai-preset-search-toggle-active')
+        && !document.querySelector('.bai-bai-preset-search-input')) {
+        toggle.click();
+    }
+    const input = await waitFor(() => document.querySelector('.bai-bai-preset-search-input'), 2000, 40);
+    if (!input) return false;
+
+    // 若与上次筛选词相同，先轻清再设，确保临时收起过的分组自动重新展开
+    if (input.value.trim() === filterText) {
+        input.value = '';
+        input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+    }
+    input.value = filterText;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+    try { input.blur(); } catch (e) { /* ignore */ }
+    return true;
+}
+
+// 给预设列表里的目标行加上跟随主题的居中滚动 + 呼吸灯高亮
+function highlightPresetRow(identifier) {
+    const list = document.getElementById('completion_prompt_manager_list');
+    if (list) {
+        list.querySelectorAll('.kwsearch-preset-pinned, .kwsearch-preset-flash').forEach(el => {
+            el.classList.remove('kwsearch-preset-pinned', 'kwsearch-preset-flash');
+        });
+    }
+    const item = findPresetItem(identifier);
+    if (!item) return false;
+    item.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    item.classList.add('kwsearch-preset-pinned', 'kwsearch-preset-flash');
+    setTimeout(() => item.classList.remove('kwsearch-preset-flash'), 4500);
+    return true;
+}
+
+// 在预设编辑弹窗的正文上方嵌入同款跟随主题的关键词高亮定位卡
+function attachPresetHighlightBox(contentText, query, opts) {
+    const form = document.getElementById('completion_prompt_manager_popup_entry_form')
+        || document.getElementById('completion_prompt_manager_popup');
+    if (!form) return;
+    form.querySelectorAll('.kwsearch-wi-hlbox').forEach(n => n.remove());
+    if (!query) return;
+
+    const ta = form.querySelector('#completion_prompt_manager_popup_entry_form_prompt')
+        || form.querySelector('textarea');
+    const text = `${contentText || (ta ? ta.value : '') || ''}`;
+    if (!text) return;
+
+    let re;
+    try { re = buildRegex(query, opts || {}); } catch (e) { return; }
+    re.lastIndex = 0;
+    const matches = [];
+    let m, guard = 0;
+    while ((m = re.exec(text)) !== null && guard++ < 5000) {
+        if (m[0].length === 0) { re.lastIndex++; continue; }
+        matches.push({ start: m.index, end: m.index + m[0].length, text: m[0] });
+    }
+    if (!matches.length) return;
+
+    let html = '', last = 0;
+    matches.forEach((it, i) => {
+        html += esc(text.slice(last, it.start))
+            + `<mark class="kwsearch-wi-mark" data-mi="${i}">${esc(it.text)}</mark>`;
+        last = it.end;
+    });
+    html += esc(text.slice(last));
+
+    const taVisible = Boolean(ta && ta.offsetParent !== null);
+    const box = document.createElement('div');
+    box.className = 'kwsearch-wi-hlbox';
+    box.innerHTML = `
+        <div class="kwsearch-wi-hlhead">
+            <span class="kwsearch-wi-hlmeta"><i class="fa-solid fa-highlighter"></i> 关键词匹配：<span class="kw-wi-idx">1</span>/${matches.length}</span>
+            <div class="kwsearch-wi-hlacts">
+                ${matches.length > 1 ? '<button type="button" class="kwsearch-wi-hlbtn kw-wi-prev" title="上一处">◀</button><button type="button" class="kwsearch-wi-hlbtn kw-wi-next" title="下一处">▶</button>' : ''}
+                ${taVisible ? '<button type="button" class="kwsearch-wi-hlbtn primary kw-wi-loc">定位编辑框</button>' : ''}
+                <button type="button" class="kwsearch-wi-hlbtn kw-wi-close" title="关闭高亮预览">✕</button>
+            </div>
+        </div>
+        <div class="kwsearch-wi-hlbody">${html}</div>
+    `;
+
+    const anchor = (ta && ta.parentElement)
+        ? (ta.parentElement.querySelector('.cm-editor, .CodeMirror') || ta)
+        : form.firstElementChild;
+    if (anchor && anchor.parentElement) anchor.parentElement.insertBefore(box, anchor);
+    else form.prepend(box);
+
+    const body = box.querySelector('.kwsearch-wi-hlbody');
+    const idxSpan = box.querySelector('.kw-wi-idx');
+    const marks = Array.from(body.querySelectorAll('.kwsearch-wi-mark'));
+    let cur = 0;
+
+    const centerMark = (mk) => {
+        if (!mk || !body.clientHeight) return;
+        const bodyRect = body.getBoundingClientRect();
+        const mkRect = mk.getBoundingClientRect();
+        const targetTop = body.scrollTop + (mkRect.top - bodyRect.top) - (body.clientHeight / 2) + (mkRect.height / 2);
+        body.scrollTop = Math.max(0, targetTop);
+    };
+
+    const syncEditor = (pos, focusIt, endPos) => {
+        const ratio = text.length ? (pos / text.length) : 0;
+        if (ta && ta.offsetParent !== null) {
+            try {
+                ta.scrollTop = Math.max(0, ratio * ta.scrollHeight - ta.clientHeight / 2);
+                if (focusIt) {
+                    ta.focus();
+                    try { ta.setSelectionRange(pos, endPos); } catch (e) { /* ignore */ }
+                    ta.classList.add('kwsearch-wi-ta-flash');
+                    setTimeout(() => ta.classList.remove('kwsearch-wi-ta-flash'), 1800);
+                }
+            } catch (e) { /* ignore */ }
+        } else {
+            const cmScroller = form.querySelector('.cm-scroller, .CodeMirror-scroll');
+            if (cmScroller) {
+                cmScroller.scrollTop = Math.max(0, ratio * cmScroller.scrollHeight - cmScroller.clientHeight / 2);
+            }
+        }
+    };
+
+    const activate = (idx, focusEditor) => {
+        cur = (idx + matches.length) % matches.length;
+        idxSpan.textContent = String(cur + 1);
+        marks.forEach((mk, i) => mk.classList.toggle('is-active', i === cur));
+        centerMark(marks[cur]);
+        const hit = matches[cur];
+        syncEditor(hit.start, focusEditor, hit.end);
+    };
+
+    const prevBtn = box.querySelector('.kw-wi-prev');
+    const nextBtn = box.querySelector('.kw-wi-next');
+    const locBtn = box.querySelector('.kw-wi-loc');
+    if (prevBtn) prevBtn.addEventListener('click', () => activate(cur - 1, false));
+    if (nextBtn) nextBtn.addEventListener('click', () => activate(cur + 1, false));
+    if (locBtn) locBtn.addEventListener('click', () => activate(cur, true));
+    box.querySelector('.kw-wi-close').addEventListener('click', () => box.remove());
+    body.addEventListener('click', (e) => {
+        const mk = e.target.closest('.kwsearch-wi-mark');
+        if (mk) activate(Number(mk.dataset.mi), true);
+    });
+
+    activate(0, false);
+    requestAnimationFrame(() => centerMark(marks[cur]));
+    setTimeout(() => { if (box.isConnected) centerMark(marks[cur]); }, 280);
+}
+
+function isPresetEditPopupOpen() {
+    const popup = document.getElementById('completion_prompt_manager_popup');
+    if (popup && popup.offsetParent !== null && getComputedStyle(popup).display !== 'none') return true;
+    const form = document.getElementById('completion_prompt_manager_popup_entry_form');
+    return Boolean(form && form.offsetParent !== null && getComputedStyle(form).display !== 'none');
+}
+
+// 监听编辑弹窗关闭（点左下角 ❌ / 保存）：关闭后立刻定位并高亮该条目
+function watchPresetPopupClose(target, targetId, initialName) {
+    if (kwPresetPopupWatcher) { clearInterval(kwPresetPopupWatcher); kwPresetPopupWatcher = null; }
+    let sawOpen = false;
+    const startTime = Date.now();
+
+    kwPresetPopupWatcher = setInterval(() => {
+        const open = isPresetEditPopupOpen();
+        if (open) { sawOpen = true; return; }
+        if (!sawOpen && Date.now() - startTime < 2500) return;
+        clearInterval(kwPresetPopupWatcher);
+        kwPresetPopupWatcher = null;
+        if (!sawOpen) return;
+
+        // 清理编辑弹窗里的关键词预览框，免得下次手动编辑别的条目时残留
+        document.querySelectorAll('#completion_prompt_manager_popup .kwsearch-wi-hlbox').forEach(n => n.remove());
+
+        setTimeout(async () => {
+            const latestName = (target && target.name) || initialName;
+            // 若刚刚在编辑框里改过名字，或者搜索条被收起了，重新按最新名称筛出来
+            if (!findPresetItem(targetId)) {
+                const filterText = getPresetFilterText(target, latestName);
+                await applyBaibaiPresetFilter(filterText);
+                await waitFor(() => findPresetItem(targetId), 1500, 50);
+            }
+            highlightPresetRow(targetId);
+        }, 120);
+    }, 150);
 }
 
 async function jumpPreset(identifier, name, idx) {
+    ensurePresetEnhanceStyle();
     const prompts = getPresetPrompts();
 
     // 解析「搜索时真正命中的那条」——处理 identifier 重复/为空、内容为空的情况
     let target = null;
-    // 1) 优先按下标精确定位（同一预设、未重排时最准）
     if (typeof idx === 'number' && prompts[idx] && (prompts[idx].identifier === identifier || identifier == null)) {
         target = prompts[idx];
     }
-    // 2) 按 identifier 解析；重名时优先「内容包含上次关键词」的那条，其次内容非空
     if (!target) {
         const cands = prompts.filter(p => p && p.identifier === identifier);
         if (!cands.length) {
@@ -1683,15 +1927,23 @@ async function jumpPreset(identifier, name, idx) {
             || cands[0];
     }
 
-    // 确保提示词管理器已渲染（编辑表单元素存在）
+    // 1. 确保左侧提示词管理器已打开
     const icon = document.getElementById('leftNavDrawerIcon');
     if (icon && icon.classList.contains('closedIcon')) icon.click();
     await waitFor(() => document.getElementById('completion_prompt_manager_list'), 4000);
 
-    const item = findPresetItem(target.identifier || identifier);
-    if (item) { item.scrollIntoView({ behavior: 'smooth', block: 'center' }); flash(item); }
+    const targetId = target.identifier || identifier;
 
-    // 用「命中的具体条目对象」程序化载入编辑表单：即使 identifier 重复，也能显示正确内容
+    // 2. 联动柏宝箱搜索框：只筛出目标条目及其所属分组（不改动折叠设置）
+    const filterText = getPresetFilterText(target, name);
+    const filtered = await applyBaibaiPresetFilter(filterText);
+    if (filtered) {
+        await waitFor(() => findPresetItem(targetId), 1500, 50);
+    }
+    highlightPresetRow(targetId);
+
+    // 3. 打开预设编辑框，并在编辑框上方嵌入关键词高亮定位卡 + 监听退出
+    let opened = false;
     try {
         const mod = await import('/scripts/openai.js');
         const pm = mod && mod.promptManager;
@@ -1700,17 +1952,24 @@ async function jumpPreset(identifier, name, idx) {
             if (typeof pm.clearInspectForm === 'function') pm.clearInspectForm();
             pm.loadPromptIntoEditForm(target);
             pm.showPopup();
-            return;
+            opened = true;
         }
     } catch (e) {
         console.warn(`[${EXT_ID}] 打开预设编辑表单失败`, e);
     }
 
-    // 兜底：点列表项的编辑铅笔
-    if (item) {
-        const edit = item.querySelector('.prompt-manager-edit-action');
-        if (edit) { edit.click(); return; }
+    if (!opened) {
+        const item = findPresetItem(targetId);
+        const edit = item && item.querySelector('.prompt-manager-edit-action');
+        if (edit) { edit.click(); opened = true; }
     }
+
+    if (opened) {
+        setTimeout(() => attachPresetHighlightBox(target.content, kwLastQuery, kwLastOpts), 160);
+        watchPresetPopupClose(target, targetId, name);
+        return;
+    }
+
     kwToast(`请在「AI 响应配置 → 提示词管理器」中查看：${name || identifier}`, 'info');
 }
 
