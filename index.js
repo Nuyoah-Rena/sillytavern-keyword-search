@@ -1,3 +1,4 @@
+
 import { createPresetStore, replaceText } from "./safe-data.js";
 import { createRegexStore, REGEX_SCOPES } from "./regex-data.js";
 
@@ -1301,20 +1302,320 @@ async function jumpChatFile(file, mesid) {
     kwToast('已打开该聊天存档（未定位到具体楼层）', 'info');
 }
 
+/* ---------- 世界书增强跳转：独立卡片 + 高亮脉冲 + 关键词标黄 ---------- */
+let kwWiCleanup = null;
+
+function ensureWiEnhanceStyle() {
+    if (document.getElementById('kwsearch-wi-enhance-style')) return;
+    const style = document.createElement('style');
+    style.id = 'kwsearch-wi-enhance-style';
+    style.textContent = `
+        .kwsearch-wi-isolated-hide { display: none !important; }
+        .kwsearch-wi-iso-bar {
+            display: flex; align-items: center; justify-content: space-between; gap: 8px;
+            padding: 8px 12px; margin: 6px 0 10px; border-radius: 10px;
+            background: rgba(28, 30, 40, 0.92); color: #fff6d6;
+            border: 1.5px solid rgba(255, 196, 61, 0.78);
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.28);
+            font-size: 13px; flex-wrap: wrap;
+        }
+        .kwsearch-wi-iso-info { display: flex; align-items: center; gap: 6px; min-width: 0; flex: 1; }
+        .kwsearch-wi-iso-info i { color: #ffc43d; flex-shrink: 0; }
+        .kwsearch-wi-iso-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+        .kwsearch-wi-iso-btn {
+            padding: 4px 10px; border-radius: 7px; border: 1px solid rgba(255, 196, 61, 0.8);
+            background: rgba(255, 196, 61, 0.2); color: #ffe599; font-size: 12px;
+            cursor: pointer; flex-shrink: 0; font-weight: 600;
+        }
+        .kwsearch-wi-iso-btn:active { transform: scale(0.96); }
+        @keyframes kwsearchWiPulse {
+            0%, 100% { box-shadow: 0 0 0 2px rgba(255, 196, 61, 0.85), 0 0 18px rgba(255, 196, 61, 0.55); }
+            50% { box-shadow: 0 0 0 5px rgba(255, 196, 61, 1), 0 0 30px rgba(255, 196, 61, 0.85); }
+        }
+        .kwsearch-wi-card-pinned {
+            outline: 2px solid rgba(255, 196, 61, 0.82) !important;
+            border-radius: 8px !important;
+        }
+        .kwsearch-wi-card-flash {
+            animation: kwsearchWiPulse 1.1s ease-in-out 4 !important;
+        }
+        .kwsearch-wi-hlbox {
+            margin: 6px 0 8px; border-radius: 9px; overflow: hidden;
+            border: 1.5px solid rgba(255, 196, 61, 0.72);
+            background: rgba(24, 26, 34, 0.94); color: #f1f3f8;
+            box-shadow: 0 4px 14px rgba(0, 0, 0, 0.24);
+        }
+        .kwsearch-wi-hlhead {
+            display: flex; align-items: center; justify-content: space-between; gap: 6px;
+            padding: 6px 10px; background: rgba(255, 196, 61, 0.14);
+            border-bottom: 1px solid rgba(255, 196, 61, 0.28); font-size: 12px; flex-wrap: wrap;
+        }
+        .kwsearch-wi-hlmeta { color: #ffe599; font-weight: 600; }
+        .kwsearch-wi-hlacts { display: flex; align-items: center; gap: 5px; }
+        .kwsearch-wi-hlbtn {
+            padding: 2px 8px; border-radius: 6px; border: 1px solid rgba(255, 255, 255, 0.22);
+            background: rgba(255, 255, 255, 0.08); color: #fff; font-size: 12px; cursor: pointer;
+        }
+        .kwsearch-wi-hlbtn.primary {
+            border-color: rgba(255, 196, 61, 0.8); background: rgba(255, 196, 61, 0.22); color: #ffe599;
+        }
+        .kwsearch-wi-hlbody {
+            position: relative; max-height: 170px; overflow-y: auto;
+            padding: 8px 10px; white-space: pre-wrap; word-break: break-word;
+            font-size: 13px; line-height: 1.55; -webkit-overflow-scrolling: touch;
+        }
+        .kwsearch-wi-mark {
+            background: #ffe066; color: #181818; border-radius: 3px;
+            padding: 0 2px; cursor: pointer; font-weight: 600;
+        }
+        .kwsearch-wi-mark.is-active {
+            background: #ff922b; color: #111;
+            box-shadow: 0 0 0 2px #fff, 0 0 10px rgba(255, 146, 43, 0.85);
+        }
+        .kwsearch-wi-ta-flash {
+            outline: 2px solid #ffc43d !important;
+            box-shadow: 0 0 14px rgba(255, 196, 61, 0.65) !important;
+        }
+    `;
+    document.head.appendChild(style);
+}
+
+function attachWiHighlightBox(cardEl, query, opts) {
+    cardEl.querySelectorAll('.kwsearch-wi-hlbox').forEach(n => n.remove());
+    if (!query) return;
+    const ta = cardEl.querySelector('textarea[name="content"]');
+    if (!ta) return;
+    const text = ta.value || '';
+    if (!text) return;
+
+    let re;
+    try { re = buildRegex(query, opts || {}); } catch (e) { return; }
+    re.lastIndex = 0;
+    const matches = [];
+    let m, guard = 0;
+    while ((m = re.exec(text)) !== null && guard++ < 5000) {
+        if (m[0].length === 0) { re.lastIndex++; continue; }
+        matches.push({ start: m.index, end: m.index + m[0].length, text: m[0] });
+    }
+    if (!matches.length) return;
+
+    let html = '', last = 0;
+    matches.forEach((it, i) => {
+        html += esc(text.slice(last, it.start))
+            + `<mark class="kwsearch-wi-mark" data-mi="${i}">${esc(it.text)}</mark>`;
+        last = it.end;
+    });
+    html += esc(text.slice(last));
+
+    const box = document.createElement('div');
+    box.className = 'kwsearch-wi-hlbox';
+    box.innerHTML = `
+        <div class="kwsearch-wi-hlhead">
+            <span class="kwsearch-wi-hlmeta"><i class="fa-solid fa-highlighter"></i> 关键词匹配：<span class="kw-wi-idx">1</span>/${matches.length}</span>
+            <div class="kwsearch-wi-hlacts">
+                ${matches.length > 1 ? '<button type="button" class="kwsearch-wi-hlbtn kw-wi-prev" title="上一处">◀</button><button type="button" class="kwsearch-wi-hlbtn kw-wi-next" title="下一处">▶</button>' : ''}
+                <button type="button" class="kwsearch-wi-hlbtn primary kw-wi-loc">定位编辑框</button>
+                <button type="button" class="kwsearch-wi-hlbtn kw-wi-close" title="关闭高亮预览">✕</button>
+            </div>
+        </div>
+        <div class="kwsearch-wi-hlbody">${html}</div>
+    `;
+    ta.parentElement.insertBefore(box, ta);
+
+    const body = box.querySelector('.kwsearch-wi-hlbody');
+    const idxSpan = box.querySelector('.kw-wi-idx');
+    const marks = Array.from(body.querySelectorAll('.kwsearch-wi-mark'));
+    let cur = 0;
+
+    const scrollTextareaTo = (pos, focusIt, endPos) => {
+        try {
+            const line = text.slice(0, pos).split('\n').length - 1;
+            const st = getComputedStyle(ta);
+            let lh = parseFloat(st.lineHeight);
+            if (!lh || isNaN(lh)) lh = (parseFloat(st.fontSize) || 14) * 1.4;
+            ta.scrollTop = Math.max(0, line * lh - ta.clientHeight / 2);
+            if (focusIt) {
+                ta.focus();
+                try { ta.setSelectionRange(pos, endPos); } catch (e) { /* ignore */ }
+                ta.classList.add('kwsearch-wi-ta-flash');
+                setTimeout(() => ta.classList.remove('kwsearch-wi-ta-flash'), 1800);
+            }
+        } catch (e) { /* ignore */ }
+    };
+
+    const activate = (idx, focusTa) => {
+        cur = (idx + matches.length) % matches.length;
+        idxSpan.textContent = String(cur + 1);
+        marks.forEach((mk, i) => mk.classList.toggle('is-active', i === cur));
+        const activeMk = marks[cur];
+        if (activeMk) {
+            body.scrollTop = Math.max(0, activeMk.offsetTop - body.clientHeight / 2 + activeMk.offsetHeight / 2);
+        }
+        const hit = matches[cur];
+        scrollTextareaTo(hit.start, focusTa, hit.end);
+    };
+
+    const prevBtn = box.querySelector('.kw-wi-prev');
+    const nextBtn = box.querySelector('.kw-wi-next');
+    if (prevBtn) prevBtn.addEventListener('click', () => activate(cur - 1, false));
+    if (nextBtn) nextBtn.addEventListener('click', () => activate(cur + 1, false));
+    box.querySelector('.kw-wi-loc').addEventListener('click', () => activate(cur, true));
+    box.querySelector('.kw-wi-close').addEventListener('click', () => box.remove());
+    body.addEventListener('click', (e) => {
+        const mk = e.target.closest('.kwsearch-wi-mark');
+        if (mk) activate(Number(mk.dataset.mi), true);
+    });
+
+    activate(0, false);
+}
+
 async function jumpWorldInfo(book, uid) {
     const $ = window.jQuery;
     if (!$) return;
-    // 复刻 openWorldInfoEditor：打开世界书抽屉 + 选中对应书
+    ensureWiEnhanceStyle();
+
+    if (typeof kwWiCleanup === 'function') { kwWiCleanup(false); kwWiCleanup = null; }
+
+    // 1. 打开世界书抽屉
     if (!$('#WorldInfo').is(':visible')) $('#WIDrawerIcon').trigger('click');
-    const names = ctx().getWorldInfoNames ? ctx().getWorldInfoNames() : (window.world_names || []);
-    const index = names.indexOf(book);
-    if (index < 0) { kwToast(`没找到世界书：${book}`, 'warning'); return; }
-    $('#world_editor_select').val(index).trigger('change');
-    const sel = `#world_popup_entries_list [uid="${uid}"]`;
-    const el = await waitFor(() => document.querySelector(sel), 5000);
-    if (!el) { kwToast('已打开世界书，请在其中查找该条目', 'info'); return; }
-    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    flash(el);
+    const selEl = await waitFor(() => document.getElementById('world_editor_select'), 4000);
+    if (!selEl) { kwToast('未能打开世界书界面', 'warning'); return; }
+
+    // 2. 精确匹配目标世界书选项
+    let targetVal = null;
+    const matchedOpt = Array.from(selEl.options).find(o => o.textContent.trim() === book);
+    if (matchedOpt) targetVal = matchedOpt.value;
+    if (targetVal === null) {
+        const names = ctx().getWorldInfoNames ? ctx().getWorldInfoNames() : (window.world_names || []);
+        const index = names.indexOf(book);
+        if (index >= 0) targetVal = String(index);
+    }
+    if (targetVal === null) { kwToast(`没找到世界书：${book}`, 'warning'); return; }
+
+    const searchInput = document.getElementById('world_info_search');
+    const listEl = document.getElementById('world_popup_entries_list');
+    const entrySel = `#world_popup_entries_list .world_entry[uid="${uid}"]`;
+    const needSwitch = String(selEl.value) !== String(targetVal);
+
+    // 3. 切换世界书并等待新 DOM 真正渲染完成（避免命中旧书同 uid）
+    if (needSwitch) {
+        const oldFirst = listEl ? listEl.firstElementChild : null;
+        if (searchInput && searchInput.value) searchInput.value = '';
+        $('#world_editor_select').val(targetVal).trigger('change');
+        if (oldFirst) await waitFor(() => !oldFirst.isConnected, 3000, 50);
+        await waitFor(() => document.querySelector('#world_popup_entries_list .world_entry'), 5000, 60);
+    } else if (searchInput && searchInput.value && !document.querySelector(entrySel)) {
+        searchInput.value = '';
+        $(searchInput).trigger('input');
+        await waitFor(() => document.querySelector('#world_popup_entries_list .world_entry'), 3000, 60);
+    }
+
+    // 4. 查找词条卡片；若因分页不在当前页，借用原生搜索把它调出来
+    let el = document.querySelector(entrySel);
+    let usedNativeSearch = false;
+    let entryTitle = `#${uid}`;
+    try {
+        const loader = ctx().loadWorldInfo || window.loadWorldInfo;
+        const data = loader ? await loader(book) : null;
+        const entry = data && data.entries ? data.entries[uid] : null;
+        if (entry) {
+            const keys = [].concat(entry.key || [], entry.keysecondary || []);
+            entryTitle = entry.comment || (keys.length ? keys.join(', ') : `#${uid}`);
+            if (!el && searchInput) {
+                const cands = [];
+                if (entry.comment && `${entry.comment}`.trim().length >= 2) cands.push(`${entry.comment}`.trim());
+                if (entry.content && kwLastQuery) {
+                    try {
+                        const re = buildRegex(kwLastQuery, kwLastOpts || {});
+                        re.lastIndex = 0;
+                        const hit = re.exec(`${entry.content}`);
+                        if (hit) {
+                            const lineStart = `${entry.content}`.lastIndexOf('\n', hit.index) + 1;
+                            const lineEndRaw = `${entry.content}`.indexOf('\n', hit.index + hit[0].length);
+                            const lineEnd = lineEndRaw < 0 ? `${entry.content}`.length : lineEndRaw;
+                            const s = Math.max(lineStart, hit.index - 8);
+                            const e = Math.min(lineEnd, hit.index + hit[0].length + 14);
+                            const piece = `${entry.content}`.slice(s, e).trim();
+                            if (piece) cands.push(piece);
+                        }
+                    } catch (e) { /* ignore */ }
+                }
+                if (kwLastQuery && !(kwLastOpts && kwLastOpts.regex)) cands.push(kwLastQuery);
+                if (keys.length) cands.push(`${keys[0]}`.trim());
+
+                for (const cand of [...new Set(cands.filter(Boolean))]) {
+                    searchInput.value = cand;
+                    $(searchInput).trigger('input');
+                    el = await waitFor(() => document.querySelector(entrySel), 1800, 60);
+                    if (el) { usedNativeSearch = true; break; }
+                }
+            }
+        }
+    } catch (e) { console.warn(`[${EXT_ID}] 世界书辅助定位失败`, e); }
+
+    if (!el) el = await waitFor(() => document.querySelector(entrySel), 1500, 60);
+    if (!el) { kwToast('已打开世界书，但未能自动定位到该词条', 'info'); return; }
+
+    // 5. 独立显示目标卡片（隐藏同级其他词条）+ 顶部还原栏
+    const curList = document.getElementById('world_popup_entries_list');
+    if (curList) {
+        curList.querySelectorAll('.kwsearch-wi-iso-bar').forEach(n => n.remove());
+        curList.querySelectorAll('.world_entry').forEach(card => {
+            if (card !== el) card.classList.add('kwsearch-wi-isolated-hide');
+            else card.classList.remove('kwsearch-wi-isolated-hide');
+        });
+    }
+
+    const isoBar = document.createElement('div');
+    isoBar.className = 'kwsearch-wi-iso-bar';
+    isoBar.innerHTML = `
+        <div class="kwsearch-wi-iso-info">
+            <i class="fa-solid fa-crosshairs"></i>
+            <span class="kwsearch-wi-iso-title">已独立定位：${esc(entryTitle)}</span>
+        </div>
+        <button type="button" class="kwsearch-wi-iso-btn">显示全部词条</button>
+    `;
+    if (curList) curList.insertBefore(isoBar, curList.firstChild);
+
+    const onUserSearch = (e) => { if (e && e.isTrusted && kwWiCleanup) { kwWiCleanup(false); kwWiCleanup = null; } };
+    const onBookChange = () => { if (kwWiCleanup) { kwWiCleanup(false); kwWiCleanup = null; } };
+
+    kwWiCleanup = (restoreSearch) => {
+        isoBar.remove();
+        document.querySelectorAll('#world_popup_entries_list .kwsearch-wi-isolated-hide')
+            .forEach(card => card.classList.remove('kwsearch-wi-isolated-hide'));
+        document.querySelectorAll('#world_popup_entries_list .kwsearch-wi-card-pinned, #world_popup_entries_list .kwsearch-wi-card-flash')
+            .forEach(card => card.classList.remove('kwsearch-wi-card-pinned', 'kwsearch-wi-card-flash'));
+        if (searchInput) searchInput.removeEventListener('input', onUserSearch);
+        if (selEl) selEl.removeEventListener('change', onBookChange);
+        if (restoreSearch && usedNativeSearch && searchInput) {
+            searchInput.value = '';
+            $(searchInput).trigger('input');
+        }
+    };
+
+    isoBar.querySelector('.kwsearch-wi-iso-btn').addEventListener('click', () => {
+        if (kwWiCleanup) { kwWiCleanup(true); kwWiCleanup = null; }
+    });
+    if (searchInput) searchInput.addEventListener('input', onUserSearch);
+    if (selEl) selEl.addEventListener('change', onBookChange);
+
+    // 6. 自动展开词条卡片
+    const mainDrawer = el.querySelector(':scope > .inline-drawer') || el.querySelector('.inline-drawer');
+    if (mainDrawer) {
+        const contentDiv = mainDrawer.querySelector(':scope > .inline-drawer-content');
+        const toggleEl = mainDrawer.querySelector(':scope > .inline-drawer-header .inline-drawer-toggle, :scope > .inline-drawer-toggle, .inline-drawer-toggle');
+        const isHidden = contentDiv && ($(contentDiv).is(':hidden') || getComputedStyle(contentDiv).display === 'none');
+        if (isHidden && toggleEl) $(toggleEl).trigger('click');
+    }
+
+    // 7. 等待展开动画后，执行卡片高亮脉冲 + 正文关键词标黄定位
+    setTimeout(() => {
+        el.classList.add('kwsearch-wi-card-pinned', 'kwsearch-wi-card-flash');
+        setTimeout(() => el.classList.remove('kwsearch-wi-card-flash'), 4500);
+        attachWiHighlightBox(el, kwLastQuery, kwLastOpts);
+        (isoBar.isConnected ? isoBar : el).scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }, 180);
 }
 
 // 在提示词管理器列表里按 identifier 精确找条目（避开选择器转义问题）
