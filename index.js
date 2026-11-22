@@ -162,7 +162,7 @@ async function getWorldInfoEntriesForBook(name) {
             const e = entries[uid];
             const keys = [].concat(e.key || [], e.keysecondary || []);
             const title = e.comment || (keys.length ? keys.join(', ') : `#${uid}`);
-            out.push({ title: `${name} · ${title}`, content: `${e.content || ''}`, jump: { type: 'wi', book: name, uid } });
+            out.push({ title: `${name} · ${title}`, content: `${e.content || ''}`, keysText: keys.filter(Boolean).join(', '), jump: { type: 'wi', book: name, uid } });
         }
     } catch (err) {
         console.warn(`[${EXT_ID}] 世界书读取失败: ${name}`, err);
@@ -242,7 +242,7 @@ async function getCharBoundWorldItems(ch) {
                     const e = entries[uid];
                     const keys = [].concat(e.key || [], e.keysecondary || []);
                     const title = e.comment || (keys.length ? keys.join(', ') : `#${uid}`);
-                    out.push({ title: `${name} · ${title}`, content: `${e.content || ''}`, jump: { type: 'wi', book: name, uid } });
+                    out.push({ title: `${name} · ${title}`, content: `${e.content || ''}`, keysText: keys.filter(Boolean).join(', '), jump: { type: 'wi', book: name, uid } });
                 }
             } catch (e) { console.warn(`[${EXT_ID}] 角色世界书读取失败: ${name}`, e); }
         }
@@ -255,7 +255,7 @@ async function getCharBoundWorldItems(ch) {
             if (!e) continue;
             const keys = [].concat(e.keys || e.key || []);
             const title = e.comment || (keys.length ? keys.join(', ') : '(内嵌条目)');
-            out.push({ title: `内嵌 · ${title}`, content: `${e.content || ''}` });
+            out.push({ title: `内嵌 · ${title}`, content: `${e.content || ''}`, keysText: keys.filter(Boolean).join(', ') });
         }
     }
     return out;
@@ -440,12 +440,24 @@ function scan(items, query, opts) {
 
 async function runSearch(query, scopes, opts, onProgress) {
     const groups = [];
+    const toKeyItems = (list) => list
+        .filter(it => it && it.keysText)
+        .map(it => ({
+            title: it.title,
+            content: it.keysText,
+            jump: it.jump ? { ...it.jump, focusKey: true } : undefined,
+        }));
+
     if (scopes.preset) {
-        const items = getPresetPrompts()
-            .map((p, i) => ({ p, i }))
-            .filter(({ p }) => p && !p.marker && p.content)
+        const allPrompts = getPresetPrompts().map((p, i) => ({ p, i })).filter(({ p }) => p && !p.marker);
+        const items = allPrompts
+            .filter(({ p }) => p.content)
             .map(({ p, i }) => ({ title: p.name || p.identifier || '(未命名条目)', content: `${p.content}`, jump: { type: 'preset', identifier: p.identifier, name: p.name, idx: i } }));
         groups.push({ label: '当前预设', icon: 'fa-sliders', cat: 'preset', ...scan(items, query, opts) });
+        const nameItems = allPrompts
+            .filter(({ p }) => p.name)
+            .map(({ p, i }) => ({ title: `${p.name}`, content: `${p.name}`, jump: { type: 'preset', identifier: p.identifier, name: p.name, idx: i } }));
+        groups.push({ label: '当前预设 · 条目名', icon: 'fa-tag', cat: 'presetName', ...scan(nameItems, query, opts) });
     }
     const regexGroups = await regexStore.collect(scopes);
     for (const group of regexGroups) {
@@ -456,11 +468,13 @@ async function runSearch(query, scopes, opts, onProgress) {
         onProgress && onProgress('读取世界书…');
         const items = await getWorldInfoEntries();
         groups.push({ label: '世界书', icon: 'fa-book', cat: 'wi', ...scan(items, query, opts) });
+        groups.push({ label: '世界书 · 触发词', icon: 'fa-key', cat: 'wiKey', ...scan(toKeyItems(items), query, opts) });
     }
     if (scopes.worldOne && scopes.worldOneBook) {
         onProgress && onProgress('读取指定世界书…');
         const items = await getWorldInfoEntriesForBook(scopes.worldOneBook);
         groups.push({ label: `指定世界书：${scopes.worldOneBook}`, icon: 'fa-book-bookmark', cat: 'wi', ...scan(items, query, opts) });
+        groups.push({ label: `指定世界书：${scopes.worldOneBook} · 触发词`, icon: 'fa-key', cat: 'wiKey', ...scan(toKeyItems(items), query, opts) });
     }
     if (scopes.char) {
         const cc = ctx();
@@ -468,7 +482,10 @@ async function runSearch(query, scopes, opts, onProgress) {
         groups.push({ label: '当前角色卡', icon: 'fa-user', cat: 'char', ...scan(getCharacterFields(), query, opts) });
         onProgress && onProgress('读取角色世界书…');
         const wItems = await getCharBoundWorldItems(ch);
-        if (wItems.length) groups.push({ label: '角色世界书', icon: 'fa-book', cat: 'wi', ...scan(wItems, query, opts) });
+        if (wItems.length) {
+            groups.push({ label: '角色世界书', icon: 'fa-book', cat: 'wi', ...scan(wItems, query, opts) });
+            groups.push({ label: '角色世界书 · 触发词', icon: 'fa-key', cat: 'wiKey', ...scan(toKeyItems(wItems), query, opts) });
+        }
         onProgress && onProgress('扫描该角色聊天…');
         const cItems = await getCharacterChatItems(ch);
         if (cItems.length) groups.push({ label: '该角色聊天', icon: 'fa-comments', cat: 'chat', ...scan(cItems, query, opts) });
@@ -487,6 +504,26 @@ async function runSearch(query, scopes, opts, onProgress) {
     if (scopes.presetAll) {
         onProgress && onProgress('读取全部预设…');
         groups.push({ label: '全部预设', icon: 'fa-layer-group', cat: 'preset', ...scan(getAllPresetItems(), query, opts) });
+        const pm = getOpenAIPresetManager();
+        if (pm && typeof pm.getAllPresets === 'function' && typeof pm.getCompletionPresetByName === 'function') {
+            const names = pm.getAllPresets() || [];
+            const cur = (typeof pm.getSelectedPresetName === 'function') ? pm.getSelectedPresetName() : null;
+            const nameItems = [];
+            for (const presetName of names) {
+                let preset;
+                try { preset = pm.getCompletionPresetByName(presetName); } catch (e) { preset = null; }
+                const prompts = (preset && Array.isArray(preset.prompts)) ? preset.prompts : [];
+                for (const p of prompts) {
+                    if (!p || p.marker || !p.name) continue;
+                    nameItems.push({
+                        title: `${presetName} · ${p.name}`,
+                        content: `${p.name}`,
+                        jump: { type: 'presetAll', preset: presetName, identifier: p.identifier, name: p.name, isCurrent: presetName === cur },
+                    });
+                }
+            }
+            groups.push({ label: '全部预设 · 条目名', icon: 'fa-tag', cat: 'presetName', ...scan(nameItems, query, opts) });
+        }
     }
     return groups;
 }
@@ -607,13 +644,47 @@ function applyTheme(panel, key) {
     }
 }
 
-const KW_CATS = [['preset', '预设条目'], ['char', '角色卡'], ['wi', '世界书'], ['chat', '聊天记录'], ['regex', '正则替换内容']];
+const KW_CATS = [
+    ['preset', '预设条目'],
+    ['presetName', '预设条目名'],
+    ['wi', '世界书'],
+    ['wiKey', '世界书触发词'],
+    ['char', '角色卡'],
+    ['chat', '聊天记录'],
+    ['regex', '正则替换内容'],
+];
 
-function applyTab(panel, cat) {
+function applyTabsState(panel) {
+    const present = panel._kwPresentCats || [];
+    const selected = panel._kwSelectedCats || new Set(present);
+    const allOn = present.length > 0 && present.every(k => selected.has(k));
+
     panel.querySelectorAll('.kwsearch-group').forEach(g => {
-        g.style.display = (cat === 'all' || g.dataset.cat === cat) ? '' : 'none';
+        g.style.display = selected.has(g.dataset.cat) ? '' : 'none';
     });
-    panel.querySelectorAll('.kws-tab').forEach(t => t.classList.toggle('on', t.dataset.cat === cat));
+    const allBtn = panel.querySelector('.kws-tab[data-cat="all"]');
+    if (allBtn) allBtn.classList.toggle('on', allOn);
+
+    panel.querySelectorAll('.kws-tab[data-cat]:not([data-cat="all"])').forEach(t => {
+        const isOn = selected.has(t.dataset.cat);
+        t.classList.toggle('on', isOn);
+        t.classList.toggle('is-muted', !isOn);
+    });
+
+    const box = panel.querySelector('.kwsearch-results');
+    if (box) {
+        const oldEmpty = box.querySelector('.kwsearch-filter-empty');
+        if (present.length > 0 && selected.size === 0) {
+            if (!oldEmpty) {
+                const div = document.createElement('div');
+                div.className = 'kwsearch-empty kwsearch-filter-empty';
+                div.textContent = '已隐藏所有分类，点击上方标签或「全部」恢复显示';
+                box.appendChild(div);
+            }
+        } else if (oldEmpty) {
+            oldEmpty.remove();
+        }
+    }
 }
 
 function renderResults(panel, groups, query) {
@@ -624,16 +695,17 @@ function renderResults(panel, groups, query) {
     const hits = groups.reduce((a, g) => a + g.results.length, 0);
     summary.innerHTML = `关键词 “<b>${esc(query)}</b>” 共出现 <b>${grand}</b> 次，分布在 <b>${hits}</b> 个条目中。`;
 
-    // 只显示有结果的分组
     const shown = groups.filter(g => g.results.length > 0);
 
-    // 分类标签卡：仅出现有结果的类别
+    // 分类标签卡：默认全部显示，支持多选与右侧灰色叉叉一键隐藏
     const present = KW_CATS.filter(([k]) => shown.some(g => g.cat === k));
+    panel._kwPresentCats = present.map(([k]) => k);
+    panel._kwSelectedCats = new Set(panel._kwPresentCats);
     if (present.length > 0) {
-        let th = `<button class="kws-tab on" data-cat="all">全部</button>`;
+        let th = `<button type="button" class="kws-tab on" data-cat="all">全部</button>`;
         for (const [k, name] of present) {
             const n = shown.filter(g => g.cat === k).reduce((a, g) => a + g.results.length, 0);
-            th += `<button class="kws-tab" data-cat="${k}">${name} <span class="kws-tab-n">${n}</span></button>`;
+            th += `<button type="button" class="kws-tab on" data-cat="${k}"><span>${name}</span> <span class="kws-tab-n">${n}</span><span class="kws-tab-x" data-hide-cat="${k}" title="不显示此分类" role="button" aria-label="不显示${name}"><svg viewBox="0 0 12 12" width="10" height="10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7"/></svg></span></button>`;
         }
         tabsBox.innerHTML = th;
     } else {
@@ -670,7 +742,7 @@ function renderResults(panel, groups, query) {
     if (!shown.length) html = `<div class="kwsearch-empty">没有找到匹配的内容</div>`;
     box.innerHTML = html;
     panel._kwJumps = jumps;
-    applyTab(panel, 'all');
+    applyTabsState(panel);
 }
 
 let kwSearching = false;
@@ -1245,7 +1317,7 @@ async function doJump(jump) {
     switch (jump.type) {
         case 'chat': return jumpChat(jump.mesid);
         case 'chatfile': return jumpChatFile(jump.file, jump.mesid);
-        case 'wi': return jumpWorldInfo(jump.book, jump.uid);
+        case 'wi': return jumpWorldInfo(jump.book, jump.uid, Boolean(jump.focusKey));
         case 'preset': return jumpPreset(jump.identifier, jump.name, jump.idx);
         case 'presetAll': return jumpPresetGlobal(jump);
         case 'regexReplacement': return showRegexReplacementViewer(jump.target);
@@ -1489,6 +1561,33 @@ function ensureWiEnhanceStyle() {
             background: rgba(255, 146, 43, 0.62) !important;
             box-shadow: 0 0 0 1.5px rgba(232, 89, 12, 0.95) !important;
         }
+/* 分类标签多选 + 数字右侧灰色叉叉 */
+        .kwsearch-tabs .kws-tab {
+            display: inline-flex !important; align-items: center !important; gap: 4px !important;
+        }
+        .kwsearch-tabs .kws-tab.is-muted {
+            opacity: 0.45 !important;
+        }
+        .kwsearch-tabs .kws-tab-x {
+            display: inline-flex; align-items: center; justify-content: center;
+            width: 16px; height: 16px; margin-left: 2px; border-radius: 50%;
+            color: #8f959e; transition: color 0.15s, background-color 0.15s, opacity 0.15s;
+        }
+        .kwsearch-tabs .kws-tab.is-muted .kws-tab-x {
+            opacity: 0.35;
+        }
+        .kwsearch-tabs .kws-tab-x:hover, .kwsearch-tabs .kws-tab-x:active {
+            color: #50545c; background: rgba(143, 149, 158, 0.22);
+        }
+        /* 预览卡片统一高度：iPhone 上约 2.5cm，想微调改 150px 这个数字即可 */
+        .kwsearch-results .kwsearch-item {
+            height: 150px !important;
+            max-height: 150px !important;
+            overflow-y: auto !important;
+            box-sizing: border-box !important;
+            overscroll-behavior: auto;
+            -webkit-overflow-scrolling: touch;
+        }
     `;
     document.head.appendChild(style);
 }
@@ -1717,7 +1816,7 @@ function attachNativeEditorHighlightBar({ host, ta, cmEditor, initialText, query
             updateBarState();
             if (hlVisible) renderMarks();
         };
-        const onLayoutKick = () => { if (alive && hlVisible) syncLayout(); };
+        const onLayoutKick = () => { if (!alive) return; if (!host.isConnected || !ta.isConnected) { cleanup(); return; } if (hlVisible) syncLayout(); };
 
         ta.addEventListener('scroll', onScroll, { passive: true });
         ta.addEventListener('input', onInput);
@@ -2000,15 +2099,36 @@ function attachNativeEditorHighlightBar({ host, ta, cmEditor, initialText, query
     setTimeout(() => { if (alive && hlVisible) repaintOnly(); }, 600);
 }
 
-function attachWiHighlightBox(cardEl, query, opts) {
+function attachWiHighlightBox(cardEl, query, opts, focusKey = false) {
     if (!cardEl) return;
-    const ta = cardEl.querySelector('textarea[name="content"]');
-    const cmEditor = (ta && ta.parentElement && ta.parentElement.querySelector('.cm-editor, .CodeMirror'))
+    const contentTa = cardEl.querySelector('textarea[name="content"]');
+    const keyTa = cardEl.querySelector('textarea[name="key"]');
+    const secKeyTa = cardEl.querySelector('textarea[name="keysecondary"]');
+    const hasMatch = (taEl) => {
+        if (!taEl || !taEl.value || !query) return false;
+        try {
+            const re = buildRegex(query, opts || {});
+            re.lastIndex = 0;
+            return re.test(taEl.value);
+        } catch (e) { return false; }
+    };
+
+    let ta = contentTa;
+    let cmEditor = (contentTa && contentTa.parentElement && contentTa.parentElement.querySelector('.cm-editor, .CodeMirror'))
         || cardEl.querySelector('.cm-editor, .CodeMirror');
+
+    if (focusKey) {
+        if (hasMatch(keyTa)) { ta = keyTa; cmEditor = null; }
+        else if (hasMatch(secKeyTa)) { ta = secKeyTa; cmEditor = null; }
+    } else if (!cmEditor && !hasMatch(contentTa)) {
+        if (hasMatch(keyTa)) { ta = keyTa; cmEditor = null; }
+        else if (hasMatch(secKeyTa)) { ta = secKeyTa; cmEditor = null; }
+    }
+
     attachNativeEditorHighlightBar({ host: cardEl, ta, cmEditor, query, opts });
 }
 
-async function jumpWorldInfo(book, uid) {
+async function jumpWorldInfo(book, uid, focusKey = false) {
     const $ = window.jQuery;
     if (!$) return;
     ensureWiEnhanceStyle();
@@ -2036,7 +2156,7 @@ async function jumpWorldInfo(book, uid) {
     const entrySel = `#world_popup_entries_list .world_entry[uid="${uid}"]`;
     const needSwitch = String(selEl.value) !== String(targetVal);
 
-    // 3. 切换世界书并等待新 DOM 真正渲染完成（避免命中旧书同 uid）
+    // 3. 切换世界书并等待新 DOM 渲染完成
     if (needSwitch) {
         const oldFirst = listEl ? listEl.firstElementChild : null;
         if (searchInput && searchInput.value) searchInput.value = '';
@@ -2049,7 +2169,7 @@ async function jumpWorldInfo(book, uid) {
         await waitFor(() => document.querySelector('#world_popup_entries_list .world_entry'), 3000, 60);
     }
 
-    // 4. 查找词条卡片；若因分页不在当前页，借用原生搜索把它调出来
+    // 4. 查找词条卡片；若因分页不在当前页，借用原生搜索调出来
     let el = document.querySelector(entrySel);
     let usedNativeSearch = false;
     let entryTitle = `#${uid}`;
@@ -2095,7 +2215,7 @@ async function jumpWorldInfo(book, uid) {
     if (!el) el = await waitFor(() => document.querySelector(entrySel), 1500, 60);
     if (!el) { kwToast('已打开世界书，但未能自动定位到该词条', 'info'); return; }
 
-    // 5. 独立显示目标卡片（隐藏同级其他词条）+ 顶部还原栏
+    // 5. 独立显示目标卡片 + 顶部还原栏
     const curList = document.getElementById('world_popup_entries_list');
     if (curList) {
         curList.querySelectorAll('.kwsearch-wi-iso-bar').forEach(n => n.remove());
@@ -2116,10 +2236,18 @@ async function jumpWorldInfo(book, uid) {
     `;
     if (curList) curList.insertBefore(isoBar, curList.firstChild);
 
+    let disposed = false;
     const onUserSearch = (e) => { if (e && e.isTrusted && kwWiCleanup) { kwWiCleanup(false); kwWiCleanup = null; } };
     const onBookChange = () => { if (kwWiCleanup) { kwWiCleanup(false); kwWiCleanup = null; } };
 
     kwWiCleanup = (restoreSearch) => {
+        disposed = true;
+        if (el && typeof el._kwHlCleanup === 'function') el._kwHlCleanup();
+        document.querySelectorAll('#world_popup_entries_list .world_entry').forEach(card => {
+            if (typeof card._kwHlCleanup === 'function') card._kwHlCleanup();
+            card.querySelectorAll('.kwsearch-wi-hlbox, .kwsearch-ta-hl-layer').forEach(n => n.remove());
+        });
+        clearKwCssHighlights();
         isoBar.remove();
         document.querySelectorAll('#world_popup_entries_list .kwsearch-wi-isolated-hide')
             .forEach(card => card.classList.remove('kwsearch-wi-isolated-hide'));
@@ -2148,11 +2276,12 @@ async function jumpWorldInfo(book, uid) {
         if (isHidden && toggleEl) $(toggleEl).trigger('click');
     }
 
-    // 7. 等待展开动画后，执行卡片高亮脉冲 + 正文关键词标黄定位
+    // 7. 等待展开动画后，执行卡片高亮脉冲 + 正文/触发词高亮定位
     setTimeout(() => {
+        if (disposed || !el.isConnected) return;
         el.classList.add('kwsearch-wi-card-pinned', 'kwsearch-wi-card-flash');
         setTimeout(() => el.classList.remove('kwsearch-wi-card-flash'), 4500);
-        attachWiHighlightBox(el, kwLastQuery, kwLastOpts);
+        attachWiHighlightBox(el, kwLastQuery, kwLastOpts, focusKey);
         (isoBar.isConnected ? isoBar : el).scrollIntoView({ behavior: 'smooth', block: 'start' });
     }, 180);
 }
@@ -2737,11 +2866,43 @@ function buildPanel(prefill) {
         syncWorldPick();
     }
 
-    // 分类标签卡筛选
-    panel.querySelector('.kwsearch-tabs').addEventListener('click', (e) => {
-        const t = e.target.closest('.kws-tab');
-        if (t) applyTab(panel, t.dataset.cat);
-    });
+ // 分类标签卡筛选（支持多选叠加 + 点击数字右侧灰色叉叉隐藏该分类）
+ panel.querySelector('.kwsearch-tabs').addEventListener('click', (e) => {
+     const present = panel._kwPresentCats || [];
+     if (!present.length) return;
+     if (!panel._kwSelectedCats) panel._kwSelectedCats = new Set(present);
+     const selected = panel._kwSelectedCats;
+
+     const closeX = e.target.closest('.kws-tab-x');
+     if (closeX) {
+         e.preventDefault();
+         e.stopPropagation();
+         const cat = closeX.dataset.hideCat;
+         if (cat && selected.has(cat)) selected.delete(cat);
+         else if (cat) selected.add(cat);
+         applyTabsState(panel);
+         return;
+     }
+
+     const t = e.target.closest('.kws-tab');
+     if (!t) return;
+     const cat = t.dataset.cat;
+     if (cat === 'all') {
+         panel._kwSelectedCats = new Set(present);
+         applyTabsState(panel);
+         return;
+     }
+
+     const allOn = present.length > 1 && present.every(k => selected.has(k));
+     if (allOn) {
+         panel._kwSelectedCats = new Set([cat]);
+     } else if (selected.has(cat)) {
+         selected.delete(cat);
+     } else {
+         selected.add(cat);
+     }
+     applyTabsState(panel);
+ });
 
     return panel;
 }
