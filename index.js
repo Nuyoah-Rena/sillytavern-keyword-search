@@ -1,3 +1,4 @@
+
 import { createPresetStore, replaceText } from "./safe-data.js";
 import { createRegexStore, REGEX_SCOPES } from "./regex-data.js";
 
@@ -1276,14 +1277,59 @@ async function ensureMessageRendered(mesid) {
     return el;
 }
 
+async function runChatJumpCommand(mesid) {
+    const c = ctx();
+    const hasCmd = !c.SlashCommandParser || !c.SlashCommandParser.commands
+        || Boolean(c.SlashCommandParser.commands['chat-jump']);
+    if (!hasCmd) return false;
+    const cmd = `/chat-jump ${mesid}`;
+    try {
+        if (typeof c.executeSlashCommandsWithOptions === 'function') {
+            await c.executeSlashCommandsWithOptions(cmd, { handleExecutionErrors: false });
+            return true;
+        }
+        if (typeof c.executeSlashCommands === 'function') {
+            await c.executeSlashCommands(cmd);
+            return true;
+        }
+        const sc = await import('/scripts/slash-commands.js');
+        if (sc && typeof sc.executeSlashCommandsWithOptions === 'function') {
+            await sc.executeSlashCommandsWithOptions(cmd, { handleExecutionErrors: false });
+            return true;
+        }
+        if (sc && typeof sc.executeSlashCommands === 'function') {
+            await sc.executeSlashCommands(cmd);
+            return true;
+        }
+    } catch (e) {
+        console.warn(`[${EXT_ID}] /chat-jump 执行失败，回退普通定位`, e);
+    }
+    return false;
+}
+
 async function jumpChat(mesid) {
+    const jumped = await runChatJumpCommand(mesid);
+    if (jumped) {
+        const el = await waitFor(() => document.querySelector(`.mes[mesid="${mesid}"]`), 2500, 60);
+        if (el) {
+            if (el.offsetParent !== null) {
+                const rect = el.getBoundingClientRect();
+                if (rect.bottom < 0 || rect.top > window.innerHeight) {
+                    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                }
+            }
+            flash(el);
+        }
+        return;
+    }
+    // 兜底：旧版酒馆无 /chat-jump 时沿用原逻辑
     const el = await ensureMessageRendered(mesid);
     if (!el) { kwToast('没找到这条消息（可能已不在当前聊天）', 'warning'); return; }
     el.scrollIntoView({ behavior: 'smooth', block: 'center' });
     flash(el);
 }
 
-// 跳到该角色某个聊天存档的具体楼层（非当前存档先打开，再定位楼层）
+// 跳到该角色某个聊天存档的具体楼层（非当前存档先打开，再通过 /chat-jump 定位楼层）
 async function jumpChatFile(file, mesid) {
     const c = ctx();
     const cur = (typeof c.getCurrentChatId === 'function') ? c.getCurrentChatId() : null;
@@ -1292,11 +1338,11 @@ async function jumpChatFile(file, mesid) {
         try { await c.openCharacterChat(file); }
         catch (e) { console.warn(`[${EXT_ID}] 打开聊天存档失败`, file, e); kwToast('未能打开该聊天存档', 'warning'); return; }
         await waitFor(() => (typeof c.getCurrentChatId === 'function' ? c.getCurrentChatId() === file : true), 5000);
-        await waitFor(() => document.querySelector('.mes[mesid]'), 3000); // 等新聊天渲染
+        await waitFor(() => document.querySelector('.mes[mesid]'), 3000);
+        await new Promise(r => setTimeout(r, 150));
     }
     if (typeof mesid === 'number') {
-        const el = await ensureMessageRendered(mesid);
-        if (el) { el.scrollIntoView({ behavior: 'smooth', block: 'center' }); flash(el); return; }
+        return jumpChat(mesid);
     }
     kwToast('已打开该聊天存档（未定位到具体楼层）', 'info');
 }
@@ -1372,7 +1418,7 @@ function ensureWiEnhanceStyle() {
         .kwsearch-wi-card-flash {
             animation: kwsearchWiPulse 1.1s ease-in-out 4 !important;
         }
-        /* 紧凑关键词导航条（无预览框，仅保留控制栏） */
+        /* 紧凑关键词导航条 */
         .kwsearch-wi-hlbox {
             margin: 6px 0 8px; border-radius: 9px; overflow: hidden;
             border: 1.5px solid var(--SmartThemeBorderColor, var(--kw-wi-accent));
@@ -1399,21 +1445,33 @@ function ensureWiEnhanceStyle() {
             font-size: 12px; cursor: pointer;
         }
         .kwsearch-wi-hlbtn:active { transform: scale(0.95); }
-        /* 原生 textarea 透明同步高亮层（不拦截点击与输入） */
+        /* 原生 textarea 透明同步高亮层（内层 translate3d 同步滚动，全 !important 防主题干扰） */
         .kwsearch-ta-hl-layer {
-            position: absolute; pointer-events: none; overflow: hidden;
-            box-sizing: border-box; border: 0; margin: 0;
+            position: absolute !important; pointer-events: none !important; overflow: hidden !important;
+            box-sizing: border-box !important; border: 0 !important; margin: 0 !important; padding: 0 !important;
+            background: transparent !important; box-shadow: none !important;
+            user-select: none !important; -webkit-user-select: none !important;
+            visibility: visible !important; opacity: 1 !important;
+            min-width: 0 !important; min-height: 0 !important; max-width: none !important; max-height: none !important;
+        }
+        .kwsearch-ta-hl-inner {
+            display: block !important; width: 100% !important; min-height: 100% !important;
+            box-sizing: border-box !important; border: 0 !important; margin: 0 !important;
             background: transparent !important; color: transparent !important;
-            white-space: pre-wrap; overflow-wrap: break-word;
-            z-index: 2; user-select: none; -webkit-user-select: none;
+            -webkit-text-fill-color: transparent !important; text-shadow: none !important;
+            white-space: pre-wrap !important; overflow-wrap: break-word !important;
+            pointer-events: none !important; will-change: transform;
         }
         .kwsearch-ed-mark {
-            background: rgba(255, 212, 59, 0.42); color: transparent !important;
-            border-radius: 3px; padding: 0; margin: 0; font-weight: inherit;
+            display: inline !important; padding: 0 !important; margin: 0 !important; border: 0 !important;
+            background-color: rgba(255, 212, 59, 0.52) !important; background-image: none !important;
+            color: transparent !important; -webkit-text-fill-color: transparent !important;
+            text-shadow: none !important; border-radius: 3px !important; font-weight: inherit !important;
+            box-shadow: 0 0 0 1px rgba(230, 165, 0, 0.42) !important;
         }
         .kwsearch-ed-mark.is-active {
-            background: rgba(255, 146, 43, 0.56);
-            box-shadow: 0 0 0 1.5px rgba(255, 146, 43, 0.92);
+            background-color: rgba(255, 146, 43, 0.65) !important;
+            box-shadow: 0 0 0 1.5px rgba(232, 89, 12, 0.95) !important;
         }
         /* CodeMirror 原生高亮（CSS Custom Highlight API + 降级遮罩层） */
         ::highlight(kwsearch-all) {
@@ -1423,14 +1481,14 @@ function ensureWiEnhanceStyle() {
             background-color: #ff922b; color: #111111;
         }
         .kwsearch-cm-hl-layer {
-            position: absolute; pointer-events: none; overflow: hidden; z-index: 3;
+            position: absolute !important; pointer-events: none !important; overflow: hidden !important; z-index: 99 !important;
         }
         .kwsearch-cm-rect {
-            position: absolute; background: rgba(255, 212, 59, 0.42); border-radius: 3px;
+            position: absolute !important; background: rgba(255, 212, 59, 0.48) !important; border-radius: 3px !important;
         }
         .kwsearch-cm-rect.is-active {
-            background: rgba(255, 146, 43, 0.56);
-            box-shadow: 0 0 0 1.5px rgba(255, 146, 43, 0.92);
+            background: rgba(255, 146, 43, 0.62) !important;
+            box-shadow: 0 0 0 1.5px rgba(232, 89, 12, 0.95) !important;
         }
     `;
     document.head.appendChild(style);
@@ -1524,42 +1582,78 @@ function attachNativeEditorHighlightBar({ host, ta, cmEditor, initialText, query
     let repaintOnly = () => {};
 
     if (!isCm) {
-        // ---- 分支 A：原生 <textarea> 透明同步高亮层 ----
+        // ---- 分支 A：原生 <textarea> 透明同步高亮层（内层 translate3d 跟随滚动） ----
+        const setImp = (el, prop, val) => el.style.setProperty(prop, val, 'important');
         const parent = ta.parentElement;
-        if (parent && getComputedStyle(parent).position === 'static') parent.style.position = 'relative';
-        const overlay = document.createElement('div');
-        overlay.className = 'kwsearch-ta-hl-layer';
-        if (parent) parent.insertBefore(overlay, ta.nextSibling);
+        if (parent && getComputedStyle(parent).position === 'static') {
+            parent.style.setProperty('position', 'relative', 'important');
+        }
+        const outer = document.createElement('div');
+        outer.className = 'kwsearch-ta-hl-layer';
+        const inner = document.createElement('div');
+        inner.className = 'kwsearch-ta-hl-inner';
+        outer.appendChild(inner);
+        if (parent) parent.insertBefore(outer, ta.nextSibling);
+        else host.appendChild(outer);
+
+        const syncScroll = () => {
+            if (!alive) return;
+            setImp(inner, 'transform', `translate3d(${-ta.scrollLeft}px, ${-ta.scrollTop}px, 0)`);
+        };
 
         const syncLayout = () => {
-            if (!alive || !ta.isConnected) return;
+            if (!alive || !ta.isConnected) return false;
+            const taRect = ta.getBoundingClientRect();
+            if (taRect.width < 2 || taRect.height < 2) {
+                setImp(outer, 'display', 'none');
+                return false;
+            }
+            setImp(outer, 'display', 'block');
             const cs = getComputedStyle(ta);
             const bl = parseFloat(cs.borderLeftWidth) || 0;
             const bt = parseFloat(cs.borderTopWidth) || 0;
-            overlay.style.left = (ta.offsetLeft + bl) + 'px';
-            overlay.style.top = (ta.offsetTop + bt) + 'px';
-            overlay.style.width = ta.clientWidth + 'px';
-            overlay.style.height = ta.clientHeight + 'px';
-            overlay.style.paddingTop = cs.paddingTop;
-            overlay.style.paddingRight = cs.paddingRight;
-            overlay.style.paddingBottom = cs.paddingBottom;
-            overlay.style.paddingLeft = cs.paddingLeft;
-            overlay.style.fontFamily = cs.fontFamily;
-            overlay.style.fontSize = cs.fontSize;
-            overlay.style.fontWeight = cs.fontWeight;
-            overlay.style.fontStyle = cs.fontStyle;
-            overlay.style.letterSpacing = cs.letterSpacing;
-            overlay.style.wordSpacing = cs.wordSpacing;
-            overlay.style.lineHeight = cs.lineHeight;
-            overlay.style.textIndent = cs.textIndent;
-            overlay.style.textTransform = cs.textTransform;
-            overlay.style.textAlign = cs.textAlign;
-            overlay.style.direction = cs.direction;
-            overlay.style.tabSize = cs.tabSize;
-            overlay.style.wordBreak = cs.wordBreak;
-            overlay.style.borderRadius = cs.borderRadius;
-            overlay.scrollTop = ta.scrollTop;
-            overlay.scrollLeft = ta.scrollLeft;
+            const taZ = parseInt(cs.zIndex, 10);
+            const zIdx = Math.max(99, isNaN(taZ) ? 99 : taZ + 1);
+
+            const op = outer.offsetParent;
+            let left = ta.offsetLeft + bl;
+            let top = ta.offsetTop + bt;
+            if (op) {
+                const opRect = op.getBoundingClientRect();
+                const opCs = getComputedStyle(op);
+                const opBl = parseFloat(opCs.borderLeftWidth) || 0;
+                const opBt = parseFloat(opCs.borderTopWidth) || 0;
+                left = taRect.left - opRect.left - opBl + op.scrollLeft + bl;
+                top = taRect.top - opRect.top - opBt + op.scrollTop + bt;
+            }
+
+            setImp(outer, 'left', left + 'px');
+            setImp(outer, 'top', top + 'px');
+            setImp(outer, 'width', ta.clientWidth + 'px');
+            setImp(outer, 'height', ta.clientHeight + 'px');
+            setImp(outer, 'z-index', String(zIdx));
+            setImp(outer, 'border-radius', cs.borderRadius);
+
+            setImp(inner, 'padding-top', cs.paddingTop);
+            setImp(inner, 'padding-right', cs.paddingRight);
+            setImp(inner, 'padding-bottom', cs.paddingBottom);
+            setImp(inner, 'padding-left', cs.paddingLeft);
+            setImp(inner, 'font-family', cs.fontFamily);
+            setImp(inner, 'font-size', cs.fontSize);
+            setImp(inner, 'font-weight', cs.fontWeight);
+            setImp(inner, 'font-style', cs.fontStyle);
+            setImp(inner, 'font-variant', cs.fontVariant);
+            setImp(inner, 'letter-spacing', cs.letterSpacing);
+            setImp(inner, 'word-spacing', cs.wordSpacing);
+            setImp(inner, 'line-height', cs.lineHeight);
+            setImp(inner, 'text-indent', cs.textIndent);
+            setImp(inner, 'text-transform', cs.textTransform);
+            setImp(inner, 'text-align', cs.textAlign);
+            setImp(inner, 'direction', cs.direction);
+            setImp(inner, 'tab-size', cs.tabSize);
+            setImp(inner, 'word-break', cs.wordBreak);
+            syncScroll();
+            return true;
         };
 
         const renderMarks = () => {
@@ -1567,41 +1661,68 @@ function attachNativeEditorHighlightBar({ host, ta, cmEditor, initialText, query
             let html = '', last = 0;
             matches.forEach((it, i) => {
                 html += esc(text.slice(last, it.start))
-                    + `<mark class="kwsearch-ed-mark${i === cur ? ' is-active' : ''}" data-mi="${i}">${esc(it.text)}</mark>`;
+                    + `<span class="kwsearch-ed-mark${i === cur ? ' is-active' : ''}" data-mi="${i}">${esc(it.text)}</span>`;
                 last = it.end;
             });
             html += esc(text.slice(last));
             if (text.endsWith('\n')) html += ' ';
-            overlay.innerHTML = html;
-            syncLayout();
+            inner.innerHTML = html;
+            return syncLayout();
         };
 
-        repaintOnly = renderMarks;
+        repaintOnly = () => { renderMarks(); };
         paintAndScroll = () => {
-            renderMarks();
-            const mk = overlay.querySelector('.kwsearch-ed-mark.is-active');
-            if (mk && ta.clientHeight) {
-                ta.scrollTop = Math.max(0, mk.offsetTop - ta.clientHeight / 2 + mk.offsetHeight / 2);
-                overlay.scrollTop = ta.scrollTop;
+            if (!renderMarks()) return;
+            const mk = inner.querySelector('.kwsearch-ed-mark.is-active');
+            if (mk && ta.clientHeight > 0) {
+                const inRect = inner.getBoundingClientRect();
+                const mkRect = mk.getBoundingClientRect();
+                const mkTop = mkRect.top - inRect.top;
+                ta.scrollTop = Math.max(0, mkTop - ta.clientHeight / 2 + mkRect.height / 2);
+                syncScroll();
+                requestAnimationFrame(() => { if (alive) { syncLayout(); syncScroll(); } });
             }
         };
 
-        const onScroll = () => { overlay.scrollTop = ta.scrollTop; overlay.scrollLeft = ta.scrollLeft; };
+        let scrollRaf = null;
+        const onScroll = () => {
+            if (scrollRaf) return;
+            scrollRaf = requestAnimationFrame(() => { scrollRaf = null; syncScroll(); });
+        };
         const onInput = () => {
             matches = scanMatches(getText());
             if (cur >= matches.length) cur = Math.max(0, matches.length - 1);
             updateBarState();
             renderMarks();
         };
+        const onLayoutKick = () => { if (alive) syncLayout(); };
+
         ta.addEventListener('scroll', onScroll, { passive: true });
         ta.addEventListener('input', onInput);
+        ta.addEventListener('focus', onLayoutKick);
+        window.addEventListener('resize', onLayoutKick);
+
+        // 等待抽屉展开动画彻底完成，拿到真实尺寸后立刻补齐定位
+        let waitTries = 0;
+        const waitTimer = setInterval(() => {
+            if (!alive || ++waitTries > 25) { clearInterval(waitTimer); return; }
+            if (ta.getBoundingClientRect().height > 10) {
+                clearInterval(waitTimer);
+                paintAndScroll();
+            }
+        }, 80);
+
         disposers.push(() => {
+            clearInterval(waitTimer);
+            if (scrollRaf) cancelAnimationFrame(scrollRaf);
             ta.removeEventListener('scroll', onScroll);
             ta.removeEventListener('input', onInput);
-            overlay.remove();
+            ta.removeEventListener('focus', onLayoutKick);
+            window.removeEventListener('resize', onLayoutKick);
+            outer.remove();
         });
         if (typeof ResizeObserver === 'function') {
-            const ro = new ResizeObserver(syncLayout);
+            const ro = new ResizeObserver(() => { if (alive) syncLayout(); });
             ro.observe(ta);
             disposers.push(() => ro.disconnect());
         }
@@ -1623,7 +1744,6 @@ function attachNativeEditorHighlightBar({ host, ta, cmEditor, initialText, query
             const view = getCmView();
             const fullText = getText();
 
-            // 1) 优先用 CM6 EditorView.domAtPos 精确映射可见区域的匹配
             if (view && typeof view.domAtPos === 'function') {
                 const vis = Array.isArray(view.visibleRanges) ? view.visibleRanges : null;
                 for (let i = 0; i < matches.length; i++) {
@@ -1645,7 +1765,6 @@ function attachNativeEditorHighlightBar({ host, ta, cmEditor, initialText, query
                 if (allRanges.length || activeRanges.length) return { allRanges, activeRanges };
             }
 
-            // 2) 兜底：直接扫描 .cm-content / .CodeMirror-code 里的文本节点
             if (!cmContent) return { allRanges, activeRanges };
             const lines = Array.from(cmContent.querySelectorAll('.cm-line, .CodeMirror-line'));
             const segs = [];
@@ -1833,17 +1952,17 @@ function attachNativeEditorHighlightBar({ host, ta, cmEditor, initialText, query
 
     updateBarState();
     activate(0);
-    setTimeout(() => { if (alive) paintAndScroll(); }, 260);
-    setTimeout(() => { if (alive) repaintOnly(); }, 500);
+    setTimeout(() => { if (alive) paintAndScroll(); }, 280);
+    setTimeout(() => { if (alive) repaintOnly(); }, 600);
 }
 
 function attachWiHighlightBox(cardEl, query, opts) {
     if (!cardEl) return;
     const ta = cardEl.querySelector('textarea[name="content"]');
-    const cmEditor = cardEl.querySelector('.cm-editor, .CodeMirror');
+    const cmEditor = (ta && ta.parentElement && ta.parentElement.querySelector('.cm-editor, .CodeMirror'))
+        || cardEl.querySelector('.cm-editor, .CodeMirror');
     attachNativeEditorHighlightBar({ host: cardEl, ta, cmEditor, query, opts });
 }
-
 
 async function jumpWorldInfo(book, uid) {
     const $ = window.jQuery;
