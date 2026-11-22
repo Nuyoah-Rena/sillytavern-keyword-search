@@ -1,4 +1,3 @@
-
 import { createPresetStore, replaceText } from "./safe-data.js";
 import { createRegexStore, REGEX_SCOPES } from "./regex-data.js";
 
@@ -1304,36 +1303,49 @@ async function jumpChatFile(file, mesid) {
 
 /* ---------- 世界书增强跳转：独立卡片 + 高亮脉冲 + 关键词标黄 ---------- */
 let kwWiCleanup = null;
-
 function ensureWiEnhanceStyle() {
     if (document.getElementById('kwsearch-wi-enhance-style')) return;
     const style = document.createElement('style');
     style.id = 'kwsearch-wi-enhance-style';
     style.textContent = `
+        :root {
+            --kw-wi-accent: var(--SmartThemeQuoteColor, var(--SmartThemeBorderColor, #d99b26));
+        }
         .kwsearch-wi-isolated-hide { display: none !important; }
         .kwsearch-wi-iso-bar {
             display: flex; align-items: center; justify-content: space-between; gap: 8px;
             padding: 8px 12px; margin: 6px 0 10px; border-radius: 10px;
-            background: rgba(28, 30, 40, 0.92); color: #fff6d6;
-            border: 1.5px solid rgba(255, 196, 61, 0.78);
-            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.28);
+            background: var(--SmartThemeBlurTintColor, rgba(28, 30, 40, 0.9));
+            color: var(--SmartThemeBodyColor, inherit);
+            border: 1.5px solid var(--kw-wi-accent);
+            box-shadow: 0 3px 12px var(--SmartThemeShadowColor, rgba(0, 0, 0, 0.14));
+            backdrop-filter: blur(var(--blurStrength, 8px));
+            -webkit-backdrop-filter: blur(var(--blurStrength, 8px));
             font-size: 13px; flex-wrap: wrap;
         }
         .kwsearch-wi-iso-info { display: flex; align-items: center; gap: 6px; min-width: 0; flex: 1; }
-        .kwsearch-wi-iso-info i { color: #ffc43d; flex-shrink: 0; }
+        .kwsearch-wi-iso-info i { color: var(--kw-wi-accent); flex-shrink: 0; }
         .kwsearch-wi-iso-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
         .kwsearch-wi-iso-btn {
-            padding: 4px 10px; border-radius: 7px; border: 1px solid rgba(255, 196, 61, 0.8);
-            background: rgba(255, 196, 61, 0.2); color: #ffe599; font-size: 12px;
-            cursor: pointer; flex-shrink: 0; font-weight: 600;
+            padding: 4px 10px; border-radius: 7px;
+            border: 1px solid var(--kw-wi-accent);
+            background: color-mix(in srgb, var(--kw-wi-accent) 18%, transparent);
+            color: var(--SmartThemeBodyColor, inherit);
+            font-size: 12px; cursor: pointer; flex-shrink: 0; font-weight: 600;
         }
         .kwsearch-wi-iso-btn:active { transform: scale(0.96); }
         @keyframes kwsearchWiPulse {
-            0%, 100% { box-shadow: 0 0 0 2px rgba(255, 196, 61, 0.85), 0 0 18px rgba(255, 196, 61, 0.55); }
-            50% { box-shadow: 0 0 0 5px rgba(255, 196, 61, 1), 0 0 30px rgba(255, 196, 61, 0.85); }
+            0%, 100% {
+                box-shadow: 0 0 0 2px color-mix(in srgb, var(--kw-wi-accent) 75%, transparent),
+                            0 0 14px color-mix(in srgb, var(--kw-wi-accent) 40%, transparent);
+            }
+            50% {
+                box-shadow: 0 0 0 4px var(--kw-wi-accent),
+                            0 0 24px color-mix(in srgb, var(--kw-wi-accent) 68%, transparent);
+            }
         }
         .kwsearch-wi-card-pinned {
-            outline: 2px solid rgba(255, 196, 61, 0.82) !important;
+            outline: 2px solid color-mix(in srgb, var(--kw-wi-accent) 82%, transparent) !important;
             border-radius: 8px !important;
         }
         .kwsearch-wi-card-flash {
@@ -1341,40 +1353,53 @@ function ensureWiEnhanceStyle() {
         }
         .kwsearch-wi-hlbox {
             margin: 6px 0 8px; border-radius: 9px; overflow: hidden;
-            border: 1.5px solid rgba(255, 196, 61, 0.72);
-            background: rgba(24, 26, 34, 0.94); color: #f1f3f8;
-            box-shadow: 0 4px 14px rgba(0, 0, 0, 0.24);
+            border: 1.5px solid var(--SmartThemeBorderColor, var(--kw-wi-accent));
+            background: var(--SmartThemeBlurTintColor, rgba(28, 30, 40, 0.9));
+            color: var(--SmartThemeBodyColor, inherit);
+            box-shadow: 0 3px 12px var(--SmartThemeShadowColor, rgba(0, 0, 0, 0.12));
+            backdrop-filter: blur(var(--blurStrength, 8px));
+            -webkit-backdrop-filter: blur(var(--blurStrength, 8px));
         }
         .kwsearch-wi-hlhead {
             display: flex; align-items: center; justify-content: space-between; gap: 6px;
-            padding: 6px 10px; background: rgba(255, 196, 61, 0.14);
-            border-bottom: 1px solid rgba(255, 196, 61, 0.28); font-size: 12px; flex-wrap: wrap;
+            padding: 6px 10px;
+            background: color-mix(in srgb, var(--kw-wi-accent) 14%, transparent);
+            border-bottom: 1px solid var(--SmartThemeBorderColor, rgba(128, 128, 128, 0.3));
+            font-size: 12px; flex-wrap: wrap;
         }
-        .kwsearch-wi-hlmeta { color: #ffe599; font-weight: 600; }
+        .kwsearch-wi-hlmeta { color: var(--SmartThemeBodyColor, inherit); font-weight: 600; }
+        .kwsearch-wi-hlmeta i { color: var(--kw-wi-accent); margin-right: 3px; }
         .kwsearch-wi-hlacts { display: flex; align-items: center; gap: 5px; }
         .kwsearch-wi-hlbtn {
-            padding: 2px 8px; border-radius: 6px; border: 1px solid rgba(255, 255, 255, 0.22);
-            background: rgba(255, 255, 255, 0.08); color: #fff; font-size: 12px; cursor: pointer;
+            padding: 2px 8px; border-radius: 6px;
+            border: 1px solid var(--SmartThemeBorderColor, rgba(128, 128, 128, 0.35));
+            background: color-mix(in srgb, var(--SmartThemeBodyColor, #888) 8%, transparent);
+            color: var(--SmartThemeBodyColor, inherit);
+            font-size: 12px; cursor: pointer;
         }
         .kwsearch-wi-hlbtn.primary {
-            border-color: rgba(255, 196, 61, 0.8); background: rgba(255, 196, 61, 0.22); color: #ffe599;
+            border-color: var(--kw-wi-accent);
+            background: color-mix(in srgb, var(--kw-wi-accent) 22%, transparent);
+            font-weight: 600;
         }
+        .kwsearch-wi-hlbtn:active { transform: scale(0.95); }
         .kwsearch-wi-hlbody {
             position: relative; max-height: 170px; overflow-y: auto;
             padding: 8px 10px; white-space: pre-wrap; word-break: break-word;
             font-size: 13px; line-height: 1.55; -webkit-overflow-scrolling: touch;
+            background: var(--SmartThemeChatTintColor, transparent);
         }
         .kwsearch-wi-mark {
-            background: #ffe066; color: #181818; border-radius: 3px;
+            background: #ffe066; color: #1c1c1c; border-radius: 3px;
             padding: 0 2px; cursor: pointer; font-weight: 600;
         }
         .kwsearch-wi-mark.is-active {
             background: #ff922b; color: #111;
-            box-shadow: 0 0 0 2px #fff, 0 0 10px rgba(255, 146, 43, 0.85);
+            box-shadow: 0 0 0 1.5px var(--SmartThemeBlurTintColor, #fff), 0 0 8px rgba(255, 146, 43, 0.75);
         }
         .kwsearch-wi-ta-flash {
-            outline: 2px solid #ffc43d !important;
-            box-shadow: 0 0 14px rgba(255, 196, 61, 0.65) !important;
+            outline: 2px solid var(--kw-wi-accent) !important;
+            box-shadow: 0 0 12px color-mix(in srgb, var(--kw-wi-accent) 55%, transparent) !important;
         }
     `;
     document.head.appendChild(style);
@@ -1427,13 +1452,18 @@ function attachWiHighlightBox(cardEl, query, opts) {
     const marks = Array.from(body.querySelectorAll('.kwsearch-wi-mark'));
     let cur = 0;
 
+    const centerMark = (mk) => {
+        if (!mk || !body.clientHeight) return;
+        const bodyRect = body.getBoundingClientRect();
+        const mkRect = mk.getBoundingClientRect();
+        const targetTop = body.scrollTop + (mkRect.top - bodyRect.top) - (body.clientHeight / 2) + (mkRect.height / 2);
+        body.scrollTop = Math.max(0, targetTop);
+    };
+
     const scrollTextareaTo = (pos, focusIt, endPos) => {
         try {
-            const line = text.slice(0, pos).split('\n').length - 1;
-            const st = getComputedStyle(ta);
-            let lh = parseFloat(st.lineHeight);
-            if (!lh || isNaN(lh)) lh = (parseFloat(st.fontSize) || 14) * 1.4;
-            ta.scrollTop = Math.max(0, line * lh - ta.clientHeight / 2);
+            const ratio = text.length ? (pos / text.length) : 0;
+            ta.scrollTop = Math.max(0, ratio * ta.scrollHeight - ta.clientHeight / 2);
             if (focusIt) {
                 ta.focus();
                 try { ta.setSelectionRange(pos, endPos); } catch (e) { /* ignore */ }
@@ -1447,10 +1477,7 @@ function attachWiHighlightBox(cardEl, query, opts) {
         cur = (idx + matches.length) % matches.length;
         idxSpan.textContent = String(cur + 1);
         marks.forEach((mk, i) => mk.classList.toggle('is-active', i === cur));
-        const activeMk = marks[cur];
-        if (activeMk) {
-            body.scrollTop = Math.max(0, activeMk.offsetTop - body.clientHeight / 2 + activeMk.offsetHeight / 2);
-        }
+        centerMark(marks[cur]);
         const hit = matches[cur];
         scrollTextareaTo(hit.start, focusTa, hit.end);
     };
@@ -1467,6 +1494,13 @@ function attachWiHighlightBox(cardEl, query, opts) {
     });
 
     activate(0, false);
+    // 等待卡片展开动画结束后再校准一次滚动，确保一打开就居中显示第 1 处
+    requestAnimationFrame(() => centerMark(marks[cur]));
+    setTimeout(() => {
+        if (!box.isConnected) return;
+        centerMark(marks[cur]);
+        scrollTextareaTo(matches[cur].start, false, matches[cur].end);
+    }, 320);
 }
 
 async function jumpWorldInfo(book, uid) {
