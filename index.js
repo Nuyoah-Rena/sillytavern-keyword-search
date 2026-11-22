@@ -1,3 +1,4 @@
+
 import { createPresetStore, replaceText } from "./safe-data.js";
 import { createRegexStore, REGEX_SCOPES } from "./regex-data.js";
 
@@ -1545,6 +1546,9 @@ function attachNativeEditorHighlightBar({ host, ta, cmEditor, initialText, query
     let matches = scanMatches(getText());
     if (!matches.length) return;
 
+    const EYE_OPEN_SVG = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="M2 12s3.8-6.5 10-6.5S22 12 22 12s-3.8 6.5-10 6.5S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>';
+    const EYE_CLOSED_SVG = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="M3 8.5Q12 17 21 8.5"/><path d="M6.5 11.2L4.5 14M9.8 12.5L8.9 15.8M14.2 12.5L15.1 15.8M17.5 11.2L19.5 14"/></svg>';
+
     const bar = document.createElement('div');
     bar.className = 'kwsearch-wi-hlbox';
     bar.innerHTML = `
@@ -1553,7 +1557,7 @@ function attachNativeEditorHighlightBar({ host, ta, cmEditor, initialText, query
             <div class="kwsearch-wi-hlacts">
                 <button type="button" class="kwsearch-wi-hlbtn kw-wi-prev" title="上一处">◀</button>
                 <button type="button" class="kwsearch-wi-hlbtn kw-wi-next" title="下一处">▶</button>
-                <button type="button" class="kwsearch-wi-hlbtn kw-wi-close" title="关闭高亮">✕</button>
+                <button type="button" class="kwsearch-wi-hlbtn kw-wi-toggle" title="隐藏高亮" aria-pressed="true" style="display:inline-flex;align-items:center;justify-content:center;padding:3px 8px;">${EYE_OPEN_SVG}</button>
             </div>
         </div>
     `;
@@ -1565,8 +1569,10 @@ function attachNativeEditorHighlightBar({ host, ta, cmEditor, initialText, query
     const totalSpan = bar.querySelector('.kw-wi-total');
     const prevBtn = bar.querySelector('.kw-wi-prev');
     const nextBtn = bar.querySelector('.kw-wi-next');
+    const toggleBtn = bar.querySelector('.kw-wi-toggle');
     let cur = 0;
     let alive = true;
+    let hlVisible = true;
     const disposers = [];
 
     const updateBarState = () => {
@@ -1577,11 +1583,20 @@ function attachNativeEditorHighlightBar({ host, ta, cmEditor, initialText, query
         nextBtn.hidden = !multi;
     };
 
+    const syncToggleBtn = () => {
+        toggleBtn.innerHTML = hlVisible ? EYE_OPEN_SVG : EYE_CLOSED_SVG;
+        toggleBtn.title = hlVisible ? '隐藏高亮' : '显示高亮';
+        toggleBtn.setAttribute('aria-pressed', String(hlVisible));
+        toggleBtn.style.opacity = hlVisible ? '' : '0.68';
+    };
+
     let paintAndScroll = () => {};
     let repaintOnly = () => {};
+    let hideHl = () => {};
+    let showHl = () => {};
 
     if (!isCm) {
-        // ---- 分支 A：原生 <textarea> 透明同步高亮层（内层 translate3d 跟随滚动） ----
+        // ---- 分支 A：原生 <textarea> 透明同步高亮层 ----
         const setImp = (el, prop, val) => el.style.setProperty(prop, val, 'important');
         const parent = ta.parentElement;
         if (parent && getComputedStyle(parent).position === 'static') {
@@ -1596,12 +1611,15 @@ function attachNativeEditorHighlightBar({ host, ta, cmEditor, initialText, query
         else host.appendChild(outer);
 
         const syncScroll = () => {
-            if (!alive) return;
+            if (!alive || !hlVisible) return;
             setImp(inner, 'transform', `translate3d(${-ta.scrollLeft}px, ${-ta.scrollTop}px, 0)`);
         };
 
         const syncLayout = () => {
-            if (!alive || !ta.isConnected) return false;
+            if (!alive || !hlVisible || !ta.isConnected) {
+                setImp(outer, 'display', 'none');
+                return false;
+            }
             const taRect = ta.getBoundingClientRect();
             if (taRect.width < 2 || taRect.height < 2) {
                 setImp(outer, 'display', 'none');
@@ -1656,6 +1674,10 @@ function attachNativeEditorHighlightBar({ host, ta, cmEditor, initialText, query
         };
 
         const renderMarks = () => {
+            if (!hlVisible) {
+                setImp(outer, 'display', 'none');
+                return false;
+            }
             const text = getText();
             let html = '', last = 0;
             matches.forEach((it, i) => {
@@ -1669,9 +1691,11 @@ function attachNativeEditorHighlightBar({ host, ta, cmEditor, initialText, query
             return syncLayout();
         };
 
-        repaintOnly = () => { renderMarks(); };
+        hideHl = () => { setImp(outer, 'display', 'none'); };
+        showHl = () => { renderMarks(); };
+        repaintOnly = () => { if (hlVisible) renderMarks(); };
         paintAndScroll = () => {
-            if (!renderMarks()) return;
+            if (!hlVisible || !renderMarks()) return;
             const mk = inner.querySelector('.kwsearch-ed-mark.is-active');
             if (mk && ta.clientHeight > 0) {
                 const inRect = inner.getBoundingClientRect();
@@ -1679,35 +1703,34 @@ function attachNativeEditorHighlightBar({ host, ta, cmEditor, initialText, query
                 const mkTop = mkRect.top - inRect.top;
                 ta.scrollTop = Math.max(0, mkTop - ta.clientHeight / 2 + mkRect.height / 2);
                 syncScroll();
-                requestAnimationFrame(() => { if (alive) { syncLayout(); syncScroll(); } });
+                requestAnimationFrame(() => { if (alive && hlVisible) { syncLayout(); syncScroll(); } });
             }
         };
 
         let scrollRaf = null;
         const onScroll = () => {
-            if (scrollRaf) return;
+            if (!hlVisible || scrollRaf) return;
             scrollRaf = requestAnimationFrame(() => { scrollRaf = null; syncScroll(); });
         };
         const onInput = () => {
             matches = scanMatches(getText());
             if (cur >= matches.length) cur = Math.max(0, matches.length - 1);
             updateBarState();
-            renderMarks();
+            if (hlVisible) renderMarks();
         };
-        const onLayoutKick = () => { if (alive) syncLayout(); };
+        const onLayoutKick = () => { if (alive && hlVisible) syncLayout(); };
 
         ta.addEventListener('scroll', onScroll, { passive: true });
         ta.addEventListener('input', onInput);
         ta.addEventListener('focus', onLayoutKick);
         window.addEventListener('resize', onLayoutKick);
 
-        // 等待抽屉展开动画彻底完成，拿到真实尺寸后立刻补齐定位
         let waitTries = 0;
         const waitTimer = setInterval(() => {
             if (!alive || ++waitTries > 25) { clearInterval(waitTimer); return; }
             if (ta.getBoundingClientRect().height > 10) {
                 clearInterval(waitTimer);
-                paintAndScroll();
+                if (hlVisible) paintAndScroll();
             }
         }, 80);
 
@@ -1721,12 +1744,12 @@ function attachNativeEditorHighlightBar({ host, ta, cmEditor, initialText, query
             outer.remove();
         });
         if (typeof ResizeObserver === 'function') {
-            const ro = new ResizeObserver(() => { if (alive) syncLayout(); });
+            const ro = new ResizeObserver(() => { if (alive && hlVisible) syncLayout(); });
             ro.observe(ta);
             disposers.push(() => ro.disconnect());
         }
     } else {
-        // ---- 分支 B：CodeMirror 原生高亮（优先 CSS Custom Highlight API，降级叠加矩形层） ----
+        // ---- 分支 B：CodeMirror 原生高亮 ----
         const canCssHl = typeof CSS !== 'undefined' && Boolean(CSS.highlights) && typeof Highlight === 'function';
         let rectLayer = null;
         if (!canCssHl) {
@@ -1822,8 +1845,20 @@ function attachNativeEditorHighlightBar({ host, ta, cmEditor, initialText, query
             return { allRanges, activeRanges };
         };
 
+        hideHl = () => {
+            clearKwCssHighlights();
+            if (rectLayer) {
+                rectLayer.innerHTML = '';
+                rectLayer.style.display = 'none';
+            }
+        };
+
         const renderCm = () => {
-            if (!alive) return { allRanges: [], activeRanges: [] };
+            if (!alive || !hlVisible) {
+                hideHl();
+                return { allRanges: [], activeRanges: [] };
+            }
+            if (rectLayer) rectLayer.style.display = '';
             const res = collectDomRanges();
             if (canCssHl) {
                 try {
@@ -1867,9 +1902,10 @@ function attachNativeEditorHighlightBar({ host, ta, cmEditor, initialText, query
             return res;
         };
 
-        repaintOnly = () => { renderCm(); };
+        showHl = () => { renderCm(); };
+        repaintOnly = () => { if (hlVisible) renderCm(); };
         paintAndScroll = () => {
-            if (!alive || !matches.length || !cmScroller) return;
+            if (!alive || !hlVisible || !matches.length || !cmScroller) return;
             const hit = matches[cur];
             const view = getCmView();
             const fullLen = getText().length || 1;
@@ -1889,14 +1925,14 @@ function attachNativeEditorHighlightBar({ host, ta, cmEditor, initialText, query
                 }
             }
             requestAnimationFrame(() => {
-                if (!alive) return;
+                if (!alive || !hlVisible) return;
                 const after = renderCm();
                 if (after.activeRanges[0]) {
                     const rRect = after.activeRanges[0].getBoundingClientRect();
                     const sRect = cmScroller.getBoundingClientRect();
                     if (rRect.top < sRect.top + 16 || rRect.bottom > sRect.bottom - 16) {
                         cmScroller.scrollTop = Math.max(0, cmScroller.scrollTop + (rRect.top - sRect.top) - sRect.height / 2 + rRect.height / 2);
-                        requestAnimationFrame(() => renderCm());
+                        requestAnimationFrame(() => { if (alive && hlVisible) renderCm(); });
                     }
                 }
             });
@@ -1904,7 +1940,7 @@ function attachNativeEditorHighlightBar({ host, ta, cmEditor, initialText, query
 
         let scrollRaf = null;
         const onCmScroll = () => {
-            if (scrollRaf) return;
+            if (!hlVisible || scrollRaf) return;
             scrollRaf = requestAnimationFrame(() => { scrollRaf = null; renderCm(); });
         };
         let editTimer = null;
@@ -1915,7 +1951,7 @@ function attachNativeEditorHighlightBar({ host, ta, cmEditor, initialText, query
                 matches = scanMatches(getText());
                 if (cur >= matches.length) cur = Math.max(0, matches.length - 1);
                 updateBarState();
-                renderCm();
+                if (hlVisible) renderCm();
             }, 140);
         };
         if (cmScroller) cmScroller.addEventListener('scroll', onCmScroll, { passive: true });
@@ -1940,6 +1976,10 @@ function attachNativeEditorHighlightBar({ host, ta, cmEditor, initialText, query
 
     const activate = (idx) => {
         if (!matches.length) return;
+        if (!hlVisible) {
+            hlVisible = true;
+            syncToggleBtn();
+        }
         cur = (idx + matches.length) % matches.length;
         updateBarState();
         paintAndScroll();
@@ -1947,12 +1987,18 @@ function attachNativeEditorHighlightBar({ host, ta, cmEditor, initialText, query
 
     prevBtn.addEventListener('click', () => activate(cur - 1));
     nextBtn.addEventListener('click', () => activate(cur + 1));
-    bar.querySelector('.kw-wi-close').addEventListener('click', cleanup);
+    toggleBtn.addEventListener('click', () => {
+        hlVisible = !hlVisible;
+        syncToggleBtn();
+        if (hlVisible) showHl();
+        else hideHl();
+    });
 
     updateBarState();
+    syncToggleBtn();
     activate(0);
-    setTimeout(() => { if (alive) paintAndScroll(); }, 280);
-    setTimeout(() => { if (alive) repaintOnly(); }, 600);
+    setTimeout(() => { if (alive && hlVisible) paintAndScroll(); }, 280);
+    setTimeout(() => { if (alive && hlVisible) repaintOnly(); }, 600);
 }
 
 function attachWiHighlightBox(cardEl, query, opts) {
