@@ -1,3 +1,4 @@
+
 import { createPresetStore, replaceText } from "./safe-data.js";
 import { createRegexStore, REGEX_SCOPES } from "./regex-data.js";
 
@@ -1303,6 +1304,7 @@ async function jumpChatFile(file, mesid) {
 
 /* ---------- 世界书增强跳转：独立卡片 + 高亮脉冲 + 关键词标黄 ---------- */
 let kwWiCleanup = null;
+
 function ensureWiEnhanceStyle() {
     if (document.getElementById('kwsearch-wi-enhance-style')) return;
     const style = document.createElement('style');
@@ -1311,6 +1313,26 @@ function ensureWiEnhanceStyle() {
         :root {
             --kw-wi-accent: var(--SmartThemeQuoteColor, var(--SmartThemeBorderColor, #d99b26));
         }
+        /* 搜索框右侧灰色细线清空按钮 */
+        .kwsearch-input-wrap {
+            position: relative; width: 100%; display: block;
+        }
+        .kwsearch-input-wrap > .kws-input {
+            width: 100% !important; padding-right: 34px !important; box-sizing: border-box !important;
+        }
+        .kws-input-clear {
+            position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+            width: 26px; height: 26px; padding: 0; margin: 0; border: none;
+            background: transparent; color: #90949c;
+            display: inline-flex; align-items: center; justify-content: center;
+            cursor: pointer; border-radius: 50%; z-index: 2;
+            transition: color 0.15s, background-color 0.15s;
+        }
+        .kws-input-clear[hidden] { display: none !important; }
+        .kws-input-clear:hover, .kws-input-clear:active {
+            color: #5c6068; background: rgba(144, 148, 156, 0.16);
+        }
+        /* 世界书独立定位栏与卡片呼吸灯 */
         .kwsearch-wi-isolated-hide { display: none !important; }
         .kwsearch-wi-iso-bar {
             display: flex; align-items: center; justify-content: space-between; gap: 8px;
@@ -1351,6 +1373,7 @@ function ensureWiEnhanceStyle() {
         .kwsearch-wi-card-flash {
             animation: kwsearchWiPulse 1.1s ease-in-out 4 !important;
         }
+        /* 紧凑关键词导航条（无预览框，仅保留控制栏） */
         .kwsearch-wi-hlbox {
             margin: 6px 0 8px; border-radius: 9px; overflow: hidden;
             border: 1.5px solid var(--SmartThemeBorderColor, var(--kw-wi-accent));
@@ -1364,144 +1387,464 @@ function ensureWiEnhanceStyle() {
             display: flex; align-items: center; justify-content: space-between; gap: 6px;
             padding: 6px 10px;
             background: color-mix(in srgb, var(--kw-wi-accent) 14%, transparent);
-            border-bottom: 1px solid var(--SmartThemeBorderColor, rgba(128, 128, 128, 0.3));
             font-size: 12px; flex-wrap: wrap;
         }
         .kwsearch-wi-hlmeta { color: var(--SmartThemeBodyColor, inherit); font-weight: 600; }
         .kwsearch-wi-hlmeta i { color: var(--kw-wi-accent); margin-right: 3px; }
         .kwsearch-wi-hlacts { display: flex; align-items: center; gap: 5px; }
         .kwsearch-wi-hlbtn {
-            padding: 2px 8px; border-radius: 6px;
+            padding: 2px 9px; border-radius: 6px;
             border: 1px solid var(--SmartThemeBorderColor, rgba(128, 128, 128, 0.35));
             background: color-mix(in srgb, var(--SmartThemeBodyColor, #888) 8%, transparent);
             color: var(--SmartThemeBodyColor, inherit);
             font-size: 12px; cursor: pointer;
         }
-        .kwsearch-wi-hlbtn.primary {
-            border-color: var(--kw-wi-accent);
-            background: color-mix(in srgb, var(--kw-wi-accent) 22%, transparent);
-            font-weight: 600;
-        }
         .kwsearch-wi-hlbtn:active { transform: scale(0.95); }
-        .kwsearch-wi-hlbody {
-            position: relative; max-height: 170px; overflow-y: auto;
-            padding: 8px 10px; white-space: pre-wrap; word-break: break-word;
-            font-size: 13px; line-height: 1.55; -webkit-overflow-scrolling: touch;
-            background: var(--SmartThemeChatTintColor, transparent);
+        /* 原生 textarea 透明同步高亮层（不拦截点击与输入） */
+        .kwsearch-ta-hl-layer {
+            position: absolute; pointer-events: none; overflow: hidden;
+            box-sizing: border-box; border: 0; margin: 0;
+            background: transparent !important; color: transparent !important;
+            white-space: pre-wrap; overflow-wrap: break-word;
+            z-index: 2; user-select: none; -webkit-user-select: none;
         }
-        .kwsearch-wi-mark {
-            background: #ffe066; color: #1c1c1c; border-radius: 3px;
-            padding: 0 2px; cursor: pointer; font-weight: 600;
+        .kwsearch-ed-mark {
+            background: rgba(255, 212, 59, 0.42); color: transparent !important;
+            border-radius: 3px; padding: 0; margin: 0; font-weight: inherit;
         }
-        .kwsearch-wi-mark.is-active {
-            background: #ff922b; color: #111;
-            box-shadow: 0 0 0 1.5px var(--SmartThemeBlurTintColor, #fff), 0 0 8px rgba(255, 146, 43, 0.75);
+        .kwsearch-ed-mark.is-active {
+            background: rgba(255, 146, 43, 0.56);
+            box-shadow: 0 0 0 1.5px rgba(255, 146, 43, 0.92);
         }
-        .kwsearch-wi-ta-flash {
-            outline: 2px solid var(--kw-wi-accent) !important;
-            box-shadow: 0 0 12px color-mix(in srgb, var(--kw-wi-accent) 55%, transparent) !important;
+        /* CodeMirror 原生高亮（CSS Custom Highlight API + 降级遮罩层） */
+        ::highlight(kwsearch-all) {
+            background-color: #ffe066; color: #181818;
+        }
+        ::highlight(kwsearch-active) {
+            background-color: #ff922b; color: #111111;
+        }
+        .kwsearch-cm-hl-layer {
+            position: absolute; pointer-events: none; overflow: hidden; z-index: 3;
+        }
+        .kwsearch-cm-rect {
+            position: absolute; background: rgba(255, 212, 59, 0.42); border-radius: 3px;
+        }
+        .kwsearch-cm-rect.is-active {
+            background: rgba(255, 146, 43, 0.56);
+            box-shadow: 0 0 0 1.5px rgba(255, 146, 43, 0.92);
         }
     `;
     document.head.appendChild(style);
 }
 
-function attachWiHighlightBox(cardEl, query, opts) {
-    cardEl.querySelectorAll('.kwsearch-wi-hlbox').forEach(n => n.remove());
-    if (!query) return;
-    const ta = cardEl.querySelector('textarea[name="content"]');
-    if (!ta) return;
-    const text = ta.value || '';
-    if (!text) return;
+function clearKwCssHighlights() {
+    try {
+        if (typeof CSS !== 'undefined' && CSS.highlights) {
+            CSS.highlights.delete('kwsearch-all');
+            CSS.highlights.delete('kwsearch-active');
+        }
+    } catch (e) { /* ignore */ }
+}
 
-    let re;
-    try { re = buildRegex(query, opts || {}); } catch (e) { return; }
-    re.lastIndex = 0;
-    const matches = [];
-    let m, guard = 0;
-    while ((m = re.exec(text)) !== null && guard++ < 5000) {
-        if (m[0].length === 0) { re.lastIndex++; continue; }
-        matches.push({ start: m.index, end: m.index + m[0].length, text: m[0] });
+function attachNativeEditorHighlightBar({ host, ta, cmEditor, initialText, query, opts, insertBeforeEl }) {
+    if (!host) return;
+    if (typeof host._kwHlCleanup === 'function') {
+        host._kwHlCleanup();
+        host._kwHlCleanup = null;
     }
+    host.querySelectorAll('.kwsearch-wi-hlbox').forEach(n => n.remove());
+    if (!query) return;
+
+    const isCm = Boolean(cmEditor && (!ta || ta.offsetParent === null));
+    if (!isCm && !ta) return;
+
+    const cmScroller = isCm ? (cmEditor.querySelector('.cm-scroller, .CodeMirror-scroll') || cmEditor) : null;
+    const cmContent = isCm ? (cmEditor.querySelector('.cm-content, .CodeMirror-code') || cmScroller) : null;
+    const getCmView = () => (cmContent && cmContent.cmView && cmContent.cmView.view)
+        || (cmEditor && cmEditor.cmView && cmEditor.cmView.view) || null;
+
+    const getText = () => {
+        if (isCm) {
+            const view = getCmView();
+            if (view && view.state && view.state.doc) return view.state.doc.toString();
+            if (ta && ta.value) return ta.value;
+            return `${initialText || (cmContent ? cmContent.innerText : '') || ''}`;
+        }
+        return ta.value || '';
+    };
+
+    const scanMatches = (text) => {
+        let re;
+        try { re = buildRegex(query, opts || {}); } catch (e) { return []; }
+        re.lastIndex = 0;
+        const out = [];
+        let m, guard = 0;
+        while ((m = re.exec(text)) !== null && guard++ < 5000) {
+            if (m[0].length === 0) { re.lastIndex++; continue; }
+            out.push({ start: m.index, end: m.index + m[0].length, text: m[0] });
+        }
+        return out;
+    };
+
+    let matches = scanMatches(getText());
     if (!matches.length) return;
 
-    let html = '', last = 0;
-    matches.forEach((it, i) => {
-        html += esc(text.slice(last, it.start))
-            + `<mark class="kwsearch-wi-mark" data-mi="${i}">${esc(it.text)}</mark>`;
-        last = it.end;
-    });
-    html += esc(text.slice(last));
-
-    const box = document.createElement('div');
-    box.className = 'kwsearch-wi-hlbox';
-    box.innerHTML = `
+    const bar = document.createElement('div');
+    bar.className = 'kwsearch-wi-hlbox';
+    bar.innerHTML = `
         <div class="kwsearch-wi-hlhead">
-            <span class="kwsearch-wi-hlmeta"><i class="fa-solid fa-highlighter"></i> 关键词匹配：<span class="kw-wi-idx">1</span>/${matches.length}</span>
+            <span class="kwsearch-wi-hlmeta"><i class="fa-solid fa-highlighter"></i> 关键词匹配：<span class="kw-wi-idx">1</span>/<span class="kw-wi-total">${matches.length}</span></span>
             <div class="kwsearch-wi-hlacts">
-                ${matches.length > 1 ? '<button type="button" class="kwsearch-wi-hlbtn kw-wi-prev" title="上一处">◀</button><button type="button" class="kwsearch-wi-hlbtn kw-wi-next" title="下一处">▶</button>' : ''}
-                <button type="button" class="kwsearch-wi-hlbtn primary kw-wi-loc">定位编辑框</button>
-                <button type="button" class="kwsearch-wi-hlbtn kw-wi-close" title="关闭高亮预览">✕</button>
+                <button type="button" class="kwsearch-wi-hlbtn kw-wi-prev" title="上一处">◀</button>
+                <button type="button" class="kwsearch-wi-hlbtn kw-wi-next" title="下一处">▶</button>
+                <button type="button" class="kwsearch-wi-hlbtn kw-wi-close" title="关闭高亮">✕</button>
             </div>
         </div>
-        <div class="kwsearch-wi-hlbody">${html}</div>
     `;
-    ta.parentElement.insertBefore(box, ta);
+    const anchor = insertBeforeEl || (isCm ? cmEditor : ta);
+    if (anchor && anchor.parentElement) anchor.parentElement.insertBefore(bar, anchor);
+    else host.prepend(bar);
 
-    const body = box.querySelector('.kwsearch-wi-hlbody');
-    const idxSpan = box.querySelector('.kw-wi-idx');
-    const marks = Array.from(body.querySelectorAll('.kwsearch-wi-mark'));
+    const idxSpan = bar.querySelector('.kw-wi-idx');
+    const totalSpan = bar.querySelector('.kw-wi-total');
+    const prevBtn = bar.querySelector('.kw-wi-prev');
+    const nextBtn = bar.querySelector('.kw-wi-next');
     let cur = 0;
+    let alive = true;
+    const disposers = [];
 
-    const centerMark = (mk) => {
-        if (!mk || !body.clientHeight) return;
-        const bodyRect = body.getBoundingClientRect();
-        const mkRect = mk.getBoundingClientRect();
-        const targetTop = body.scrollTop + (mkRect.top - bodyRect.top) - (body.clientHeight / 2) + (mkRect.height / 2);
-        body.scrollTop = Math.max(0, targetTop);
+    const updateBarState = () => {
+        totalSpan.textContent = String(matches.length);
+        idxSpan.textContent = matches.length ? String(cur + 1) : '0';
+        const multi = matches.length > 1;
+        prevBtn.hidden = !multi;
+        nextBtn.hidden = !multi;
     };
 
-    const scrollTextareaTo = (pos, focusIt, endPos) => {
-        try {
-            const ratio = text.length ? (pos / text.length) : 0;
-            ta.scrollTop = Math.max(0, ratio * ta.scrollHeight - ta.clientHeight / 2);
-            if (focusIt) {
-                ta.focus();
-                try { ta.setSelectionRange(pos, endPos); } catch (e) { /* ignore */ }
-                ta.classList.add('kwsearch-wi-ta-flash');
-                setTimeout(() => ta.classList.remove('kwsearch-wi-ta-flash'), 1800);
+    let paintAndScroll = () => {};
+    let repaintOnly = () => {};
+
+    if (!isCm) {
+        // ---- 分支 A：原生 <textarea> 透明同步高亮层 ----
+        const parent = ta.parentElement;
+        if (parent && getComputedStyle(parent).position === 'static') parent.style.position = 'relative';
+        const overlay = document.createElement('div');
+        overlay.className = 'kwsearch-ta-hl-layer';
+        if (parent) parent.insertBefore(overlay, ta.nextSibling);
+
+        const syncLayout = () => {
+            if (!alive || !ta.isConnected) return;
+            const cs = getComputedStyle(ta);
+            const bl = parseFloat(cs.borderLeftWidth) || 0;
+            const bt = parseFloat(cs.borderTopWidth) || 0;
+            overlay.style.left = (ta.offsetLeft + bl) + 'px';
+            overlay.style.top = (ta.offsetTop + bt) + 'px';
+            overlay.style.width = ta.clientWidth + 'px';
+            overlay.style.height = ta.clientHeight + 'px';
+            overlay.style.paddingTop = cs.paddingTop;
+            overlay.style.paddingRight = cs.paddingRight;
+            overlay.style.paddingBottom = cs.paddingBottom;
+            overlay.style.paddingLeft = cs.paddingLeft;
+            overlay.style.fontFamily = cs.fontFamily;
+            overlay.style.fontSize = cs.fontSize;
+            overlay.style.fontWeight = cs.fontWeight;
+            overlay.style.fontStyle = cs.fontStyle;
+            overlay.style.letterSpacing = cs.letterSpacing;
+            overlay.style.wordSpacing = cs.wordSpacing;
+            overlay.style.lineHeight = cs.lineHeight;
+            overlay.style.textIndent = cs.textIndent;
+            overlay.style.textTransform = cs.textTransform;
+            overlay.style.textAlign = cs.textAlign;
+            overlay.style.direction = cs.direction;
+            overlay.style.tabSize = cs.tabSize;
+            overlay.style.wordBreak = cs.wordBreak;
+            overlay.style.borderRadius = cs.borderRadius;
+            overlay.scrollTop = ta.scrollTop;
+            overlay.scrollLeft = ta.scrollLeft;
+        };
+
+        const renderMarks = () => {
+            const text = getText();
+            let html = '', last = 0;
+            matches.forEach((it, i) => {
+                html += esc(text.slice(last, it.start))
+                    + `<mark class="kwsearch-ed-mark${i === cur ? ' is-active' : ''}" data-mi="${i}">${esc(it.text)}</mark>`;
+                last = it.end;
+            });
+            html += esc(text.slice(last));
+            if (text.endsWith('\n')) html += ' ';
+            overlay.innerHTML = html;
+            syncLayout();
+        };
+
+        repaintOnly = renderMarks;
+        paintAndScroll = () => {
+            renderMarks();
+            const mk = overlay.querySelector('.kwsearch-ed-mark.is-active');
+            if (mk && ta.clientHeight) {
+                ta.scrollTop = Math.max(0, mk.offsetTop - ta.clientHeight / 2 + mk.offsetHeight / 2);
+                overlay.scrollTop = ta.scrollTop;
             }
-        } catch (e) { /* ignore */ }
-    };
+        };
 
-    const activate = (idx, focusTa) => {
+        const onScroll = () => { overlay.scrollTop = ta.scrollTop; overlay.scrollLeft = ta.scrollLeft; };
+        const onInput = () => {
+            matches = scanMatches(getText());
+            if (cur >= matches.length) cur = Math.max(0, matches.length - 1);
+            updateBarState();
+            renderMarks();
+        };
+        ta.addEventListener('scroll', onScroll, { passive: true });
+        ta.addEventListener('input', onInput);
+        disposers.push(() => {
+            ta.removeEventListener('scroll', onScroll);
+            ta.removeEventListener('input', onInput);
+            overlay.remove();
+        });
+        if (typeof ResizeObserver === 'function') {
+            const ro = new ResizeObserver(syncLayout);
+            ro.observe(ta);
+            disposers.push(() => ro.disconnect());
+        }
+    } else {
+        // ---- 分支 B：CodeMirror 原生高亮（优先 CSS Custom Highlight API，降级叠加矩形层） ----
+        const canCssHl = typeof CSS !== 'undefined' && Boolean(CSS.highlights) && typeof Highlight === 'function';
+        let rectLayer = null;
+        if (!canCssHl) {
+            const p = cmEditor.parentElement || host;
+            if (getComputedStyle(p).position === 'static') p.style.position = 'relative';
+            rectLayer = document.createElement('div');
+            rectLayer.className = 'kwsearch-cm-hl-layer';
+            p.appendChild(rectLayer);
+            disposers.push(() => rectLayer && rectLayer.remove());
+        }
+
+        const collectDomRanges = () => {
+            const allRanges = [], activeRanges = [];
+            const view = getCmView();
+            const fullText = getText();
+
+            // 1) 优先用 CM6 EditorView.domAtPos 精确映射可见区域的匹配
+            if (view && typeof view.domAtPos === 'function') {
+                const vis = Array.isArray(view.visibleRanges) ? view.visibleRanges : null;
+                for (let i = 0; i < matches.length; i++) {
+                    const hit = matches[i];
+                    if (vis && !vis.some(r => hit.start >= r.from && hit.end <= r.to)) continue;
+                    try {
+                        const a = view.domAtPos(hit.start);
+                        const b = view.domAtPos(hit.end);
+                        if (!a || !b || !a.node || !b.node) continue;
+                        const range = document.createRange();
+                        range.setStart(a.node, a.offset);
+                        range.setEnd(b.node, b.offset);
+                        if (!range.collapsed) {
+                            if (i === cur) activeRanges.push(range);
+                            else allRanges.push(range);
+                        }
+                    } catch (e) { /* ignore */ }
+                }
+                if (allRanges.length || activeRanges.length) return { allRanges, activeRanges };
+            }
+
+            // 2) 兜底：直接扫描 .cm-content / .CodeMirror-code 里的文本节点
+            if (!cmContent) return { allRanges, activeRanges };
+            const lines = Array.from(cmContent.querySelectorAll('.cm-line, .CodeMirror-line'));
+            const segs = [];
+            let buf = '', pos = 0;
+            const walkLine = (root) => {
+                const tw = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+                let node;
+                while ((node = tw.nextNode())) {
+                    const v = node.nodeValue || '';
+                    if (!v) continue;
+                    segs.push({ node, start: pos, end: pos + v.length });
+                    buf += v;
+                    pos += v.length;
+                }
+            };
+            if (lines.length) {
+                lines.forEach((ln, idx) => {
+                    walkLine(ln);
+                    if (idx < lines.length - 1) { buf += '\n'; pos += 1; }
+                });
+            } else {
+                walkLine(cmContent);
+            }
+
+            const visMatches = scanMatches(buf);
+            const locatePt = (offset) => {
+                for (const s of segs) {
+                    if (offset >= s.start && offset <= s.end) return { node: s.node, offset: offset - s.start };
+                }
+                return null;
+            };
+            const targetHit = matches[cur];
+            const targetCtx = targetHit ? fullText.slice(Math.max(0, targetHit.start - 10), Math.min(fullText.length, targetHit.end + 10)) : '';
+            let activeFound = false;
+
+            visMatches.forEach((vm, idx) => {
+                const a = locatePt(vm.start);
+                const b = locatePt(vm.end);
+                if (!a || !b) return;
+                try {
+                    const range = document.createRange();
+                    range.setStart(a.node, a.offset);
+                    range.setEnd(b.node, b.offset);
+                    if (range.collapsed) return;
+                    let isAct = false;
+                    if (visMatches.length === matches.length) {
+                        isAct = idx === cur;
+                    } else if (!activeFound && targetCtx) {
+                        const ctxSlice = buf.slice(Math.max(0, vm.start - 10), Math.min(buf.length, vm.end + 10));
+                        if (ctxSlice === targetCtx) { isAct = true; activeFound = true; }
+                    }
+                    if (isAct) activeRanges.push(range);
+                    else allRanges.push(range);
+                } catch (e) { /* ignore */ }
+            });
+            return { allRanges, activeRanges };
+        };
+
+        const renderCm = () => {
+            if (!alive) return { allRanges: [], activeRanges: [] };
+            const res = collectDomRanges();
+            if (canCssHl) {
+                try {
+                    if (res.allRanges.length) {
+                        const hAll = new Highlight(...res.allRanges);
+                        hAll.priority = 1;
+                        CSS.highlights.set('kwsearch-all', hAll);
+                    } else CSS.highlights.delete('kwsearch-all');
+                    if (res.activeRanges.length) {
+                        const hAct = new Highlight(...res.activeRanges);
+                        hAct.priority = 2;
+                        CSS.highlights.set('kwsearch-active', hAct);
+                    } else CSS.highlights.delete('kwsearch-active');
+                } catch (e) { /* ignore */ }
+            } else if (rectLayer && cmScroller) {
+                const p = rectLayer.parentElement;
+                const pRect = p.getBoundingClientRect();
+                const sRect = cmScroller.getBoundingClientRect();
+                rectLayer.style.left = (sRect.left - pRect.left) + 'px';
+                rectLayer.style.top = (sRect.top - pRect.top) + 'px';
+                rectLayer.style.width = sRect.width + 'px';
+                rectLayer.style.height = sRect.height + 'px';
+                rectLayer.innerHTML = '';
+                const draw = (ranges, active) => {
+                    ranges.forEach(rg => {
+                        Array.from(rg.getClientRects()).forEach(rc => {
+                            if (!rc.width || !rc.height) return;
+                            const d = document.createElement('div');
+                            d.className = 'kwsearch-cm-rect' + (active ? ' is-active' : '');
+                            d.style.left = (rc.left - sRect.left) + 'px';
+                            d.style.top = (rc.top - sRect.top) + 'px';
+                            d.style.width = rc.width + 'px';
+                            d.style.height = rc.height + 'px';
+                            rectLayer.appendChild(d);
+                        });
+                    });
+                };
+                draw(res.allRanges, false);
+                draw(res.activeRanges, true);
+            }
+            return res;
+        };
+
+        repaintOnly = () => { renderCm(); };
+        paintAndScroll = () => {
+            if (!alive || !matches.length || !cmScroller) return;
+            const hit = matches[cur];
+            const view = getCmView();
+            const fullLen = getText().length || 1;
+            if (view && typeof view.lineBlockAt === 'function') {
+                try {
+                    const block = view.lineBlockAt(hit.start);
+                    cmScroller.scrollTop = Math.max(0, block.top - cmScroller.clientHeight / 2 + block.height / 2);
+                } catch (e) { /* ignore */ }
+            } else {
+                const pre = renderCm();
+                if (pre.activeRanges[0]) {
+                    const rRect = pre.activeRanges[0].getBoundingClientRect();
+                    const sRect = cmScroller.getBoundingClientRect();
+                    cmScroller.scrollTop = Math.max(0, cmScroller.scrollTop + (rRect.top - sRect.top) - sRect.height / 2 + rRect.height / 2);
+                } else {
+                    cmScroller.scrollTop = Math.max(0, (hit.start / fullLen) * cmScroller.scrollHeight - cmScroller.clientHeight / 2);
+                }
+            }
+            requestAnimationFrame(() => {
+                if (!alive) return;
+                const after = renderCm();
+                if (after.activeRanges[0]) {
+                    const rRect = after.activeRanges[0].getBoundingClientRect();
+                    const sRect = cmScroller.getBoundingClientRect();
+                    if (rRect.top < sRect.top + 16 || rRect.bottom > sRect.bottom - 16) {
+                        cmScroller.scrollTop = Math.max(0, cmScroller.scrollTop + (rRect.top - sRect.top) - sRect.height / 2 + rRect.height / 2);
+                        requestAnimationFrame(() => renderCm());
+                    }
+                }
+            });
+        };
+
+        let scrollRaf = null;
+        const onCmScroll = () => {
+            if (scrollRaf) return;
+            scrollRaf = requestAnimationFrame(() => { scrollRaf = null; renderCm(); });
+        };
+        let editTimer = null;
+        const onCmInput = () => {
+            clearTimeout(editTimer);
+            editTimer = setTimeout(() => {
+                if (!alive) return;
+                matches = scanMatches(getText());
+                if (cur >= matches.length) cur = Math.max(0, matches.length - 1);
+                updateBarState();
+                renderCm();
+            }, 140);
+        };
+        if (cmScroller) cmScroller.addEventListener('scroll', onCmScroll, { passive: true });
+        if (cmContent) cmContent.addEventListener('input', onCmInput);
+        disposers.push(() => {
+            if (cmScroller) cmScroller.removeEventListener('scroll', onCmScroll);
+            if (cmContent) cmContent.removeEventListener('input', onCmInput);
+            if (scrollRaf) cancelAnimationFrame(scrollRaf);
+            clearTimeout(editTimer);
+            clearKwCssHighlights();
+        });
+    }
+
+    const cleanup = () => {
+        if (!alive) return;
+        alive = false;
+        disposers.forEach(fn => { try { fn(); } catch (e) { /* ignore */ } });
+        bar.remove();
+        if (host._kwHlCleanup === cleanup) host._kwHlCleanup = null;
+    };
+    host._kwHlCleanup = cleanup;
+
+    const activate = (idx) => {
+        if (!matches.length) return;
         cur = (idx + matches.length) % matches.length;
-        idxSpan.textContent = String(cur + 1);
-        marks.forEach((mk, i) => mk.classList.toggle('is-active', i === cur));
-        centerMark(marks[cur]);
-        const hit = matches[cur];
-        scrollTextareaTo(hit.start, focusTa, hit.end);
+        updateBarState();
+        paintAndScroll();
     };
 
-    const prevBtn = box.querySelector('.kw-wi-prev');
-    const nextBtn = box.querySelector('.kw-wi-next');
-    if (prevBtn) prevBtn.addEventListener('click', () => activate(cur - 1, false));
-    if (nextBtn) nextBtn.addEventListener('click', () => activate(cur + 1, false));
-    box.querySelector('.kw-wi-loc').addEventListener('click', () => activate(cur, true));
-    box.querySelector('.kw-wi-close').addEventListener('click', () => box.remove());
-    body.addEventListener('click', (e) => {
-        const mk = e.target.closest('.kwsearch-wi-mark');
-        if (mk) activate(Number(mk.dataset.mi), true);
-    });
+    prevBtn.addEventListener('click', () => activate(cur - 1));
+    nextBtn.addEventListener('click', () => activate(cur + 1));
+    bar.querySelector('.kw-wi-close').addEventListener('click', cleanup);
 
-    activate(0, false);
-    // 等待卡片展开动画结束后再校准一次滚动，确保一打开就居中显示第 1 处
-    requestAnimationFrame(() => centerMark(marks[cur]));
-    setTimeout(() => {
-        if (!box.isConnected) return;
-        centerMark(marks[cur]);
-        scrollTextareaTo(matches[cur].start, false, matches[cur].end);
-    }, 320);
+    updateBarState();
+    activate(0);
+    setTimeout(() => { if (alive) paintAndScroll(); }, 260);
+    setTimeout(() => { if (alive) repaintOnly(); }, 500);
 }
+
+function attachWiHighlightBox(cardEl, query, opts) {
+    if (!cardEl) return;
+    const ta = cardEl.querySelector('textarea[name="content"]');
+    const cmEditor = cardEl.querySelector('.cm-editor, .CodeMirror');
+    attachNativeEditorHighlightBar({ host: cardEl, ta, cmEditor, query, opts });
+}
+
 
 async function jumpWorldInfo(book, uid) {
     const $ = window.jQuery;
@@ -1756,116 +2099,24 @@ function highlightPresetRow(identifier) {
     return true;
 }
 
-// 在预设编辑弹窗的正文上方嵌入同款跟随主题的关键词高亮定位卡
+// 在预设编辑弹窗的正文上方嵌入紧凑导航条，并把高亮直接打在原生/CodeMirror编辑框里
 function attachPresetHighlightBox(contentText, query, opts) {
     const form = document.getElementById('completion_prompt_manager_popup_entry_form')
         || document.getElementById('completion_prompt_manager_popup');
     if (!form) return;
-    form.querySelectorAll('.kwsearch-wi-hlbox').forEach(n => n.remove());
-    if (!query) return;
-
     const ta = form.querySelector('#completion_prompt_manager_popup_entry_form_prompt')
         || form.querySelector('textarea');
-    const text = `${contentText || (ta ? ta.value : '') || ''}`;
-    if (!text) return;
-
-    let re;
-    try { re = buildRegex(query, opts || {}); } catch (e) { return; }
-    re.lastIndex = 0;
-    const matches = [];
-    let m, guard = 0;
-    while ((m = re.exec(text)) !== null && guard++ < 5000) {
-        if (m[0].length === 0) { re.lastIndex++; continue; }
-        matches.push({ start: m.index, end: m.index + m[0].length, text: m[0] });
-    }
-    if (!matches.length) return;
-
-    let html = '', last = 0;
-    matches.forEach((it, i) => {
-        html += esc(text.slice(last, it.start))
-            + `<mark class="kwsearch-wi-mark" data-mi="${i}">${esc(it.text)}</mark>`;
-        last = it.end;
+    const cmEditor = (ta && ta.parentElement && ta.parentElement.querySelector('.cm-editor, .CodeMirror'))
+        || form.querySelector('.cm-editor, .CodeMirror');
+    attachNativeEditorHighlightBar({
+        host: form,
+        ta,
+        cmEditor,
+        initialText: contentText,
+        query,
+        opts,
+        insertBeforeEl: cmEditor || ta,
     });
-    html += esc(text.slice(last));
-
-    const taVisible = Boolean(ta && ta.offsetParent !== null);
-    const box = document.createElement('div');
-    box.className = 'kwsearch-wi-hlbox';
-    box.innerHTML = `
-        <div class="kwsearch-wi-hlhead">
-            <span class="kwsearch-wi-hlmeta"><i class="fa-solid fa-highlighter"></i> 关键词匹配：<span class="kw-wi-idx">1</span>/${matches.length}</span>
-            <div class="kwsearch-wi-hlacts">
-                ${matches.length > 1 ? '<button type="button" class="kwsearch-wi-hlbtn kw-wi-prev" title="上一处">◀</button><button type="button" class="kwsearch-wi-hlbtn kw-wi-next" title="下一处">▶</button>' : ''}
-                ${taVisible ? '<button type="button" class="kwsearch-wi-hlbtn primary kw-wi-loc">定位编辑框</button>' : ''}
-                <button type="button" class="kwsearch-wi-hlbtn kw-wi-close" title="关闭高亮预览">✕</button>
-            </div>
-        </div>
-        <div class="kwsearch-wi-hlbody">${html}</div>
-    `;
-
-    const anchor = (ta && ta.parentElement)
-        ? (ta.parentElement.querySelector('.cm-editor, .CodeMirror') || ta)
-        : form.firstElementChild;
-    if (anchor && anchor.parentElement) anchor.parentElement.insertBefore(box, anchor);
-    else form.prepend(box);
-
-    const body = box.querySelector('.kwsearch-wi-hlbody');
-    const idxSpan = box.querySelector('.kw-wi-idx');
-    const marks = Array.from(body.querySelectorAll('.kwsearch-wi-mark'));
-    let cur = 0;
-
-    const centerMark = (mk) => {
-        if (!mk || !body.clientHeight) return;
-        const bodyRect = body.getBoundingClientRect();
-        const mkRect = mk.getBoundingClientRect();
-        const targetTop = body.scrollTop + (mkRect.top - bodyRect.top) - (body.clientHeight / 2) + (mkRect.height / 2);
-        body.scrollTop = Math.max(0, targetTop);
-    };
-
-    const syncEditor = (pos, focusIt, endPos) => {
-        const ratio = text.length ? (pos / text.length) : 0;
-        if (ta && ta.offsetParent !== null) {
-            try {
-                ta.scrollTop = Math.max(0, ratio * ta.scrollHeight - ta.clientHeight / 2);
-                if (focusIt) {
-                    ta.focus();
-                    try { ta.setSelectionRange(pos, endPos); } catch (e) { /* ignore */ }
-                    ta.classList.add('kwsearch-wi-ta-flash');
-                    setTimeout(() => ta.classList.remove('kwsearch-wi-ta-flash'), 1800);
-                }
-            } catch (e) { /* ignore */ }
-        } else {
-            const cmScroller = form.querySelector('.cm-scroller, .CodeMirror-scroll');
-            if (cmScroller) {
-                cmScroller.scrollTop = Math.max(0, ratio * cmScroller.scrollHeight - cmScroller.clientHeight / 2);
-            }
-        }
-    };
-
-    const activate = (idx, focusEditor) => {
-        cur = (idx + matches.length) % matches.length;
-        idxSpan.textContent = String(cur + 1);
-        marks.forEach((mk, i) => mk.classList.toggle('is-active', i === cur));
-        centerMark(marks[cur]);
-        const hit = matches[cur];
-        syncEditor(hit.start, focusEditor, hit.end);
-    };
-
-    const prevBtn = box.querySelector('.kw-wi-prev');
-    const nextBtn = box.querySelector('.kw-wi-next');
-    const locBtn = box.querySelector('.kw-wi-loc');
-    if (prevBtn) prevBtn.addEventListener('click', () => activate(cur - 1, false));
-    if (nextBtn) nextBtn.addEventListener('click', () => activate(cur + 1, false));
-    if (locBtn) locBtn.addEventListener('click', () => activate(cur, true));
-    box.querySelector('.kw-wi-close').addEventListener('click', () => box.remove());
-    body.addEventListener('click', (e) => {
-        const mk = e.target.closest('.kwsearch-wi-mark');
-        if (mk) activate(Number(mk.dataset.mi), true);
-    });
-
-    activate(0, false);
-    requestAnimationFrame(() => centerMark(marks[cur]));
-    setTimeout(() => { if (box.isConnected) centerMark(marks[cur]); }, 280);
 }
 
 function isPresetEditPopupOpen() {
@@ -1875,7 +2126,7 @@ function isPresetEditPopupOpen() {
     return Boolean(form && form.offsetParent !== null && getComputedStyle(form).display !== 'none');
 }
 
-// 监听编辑弹窗关闭（点左下角 ❌ / 保存）：关闭后立刻定位并高亮该条目
+// 监听编辑弹窗关闭（点左下角 ❌ / 保存）：关闭后清理高亮，并立刻定位高亮该条目
 function watchPresetPopupClose(target, targetId, initialName) {
     if (kwPresetPopupWatcher) { clearInterval(kwPresetPopupWatcher); kwPresetPopupWatcher = null; }
     let sawOpen = false;
@@ -1889,12 +2140,13 @@ function watchPresetPopupClose(target, targetId, initialName) {
         kwPresetPopupWatcher = null;
         if (!sawOpen) return;
 
-        // 清理编辑弹窗里的关键词预览框，免得下次手动编辑别的条目时残留
-        document.querySelectorAll('#completion_prompt_manager_popup .kwsearch-wi-hlbox').forEach(n => n.remove());
+        const form = document.getElementById('completion_prompt_manager_popup_entry_form')
+            || document.getElementById('completion_prompt_manager_popup');
+        if (form && typeof form._kwHlCleanup === 'function') form._kwHlCleanup();
+        clearKwCssHighlights();
 
         setTimeout(async () => {
             const latestName = (target && target.name) || initialName;
-            // 若刚刚在编辑框里改过名字，或者搜索条被收起了，重新按最新名称筛出来
             if (!findPresetItem(targetId)) {
                 const filterText = getPresetFilterText(target, latestName);
                 await applyBaibaiPresetFilter(filterText);
@@ -2170,6 +2422,34 @@ function buildPanel(prefill) {
     tmp.innerHTML = PANEL_HTML.trim();
     const panel = tmp.firstElementChild;
     const input = panel.querySelector('.kws-input');
+
+    ensureWiEnhanceStyle();
+    const inputWrap = document.createElement('div');
+    inputWrap.className = 'kwsearch-input-wrap';
+    input.parentNode.insertBefore(inputWrap, input);
+    inputWrap.appendChild(input);
+    const clearBtn = document.createElement('button');
+    clearBtn.type = 'button';
+    clearBtn.className = 'kws-input-clear';
+    clearBtn.title = '清空搜索框';
+    clearBtn.setAttribute('aria-label', '清空搜索框');
+    clearBtn.innerHTML = '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M4 4l8 8M12 4l-8 8"/></svg>';
+    inputWrap.appendChild(clearBtn);
+    const syncClearBtn = () => {
+        clearBtn.hidden = !input.value;
+        if (input.offsetHeight) clearBtn.style.top = (input.offsetTop + input.offsetHeight / 2) + 'px';
+    };
+    input.addEventListener('input', syncClearBtn);
+    panel.addEventListener('click', () => setTimeout(syncClearBtn, 0));
+    clearBtn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        input.value = '';
+        syncClearBtn();
+        input.focus();
+    });
+    setTimeout(syncClearBtn, 80);
+
     panel.querySelector('.kws-go').addEventListener('click', () => doSearch(panel));
     input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); doSearch(panel); } });
     // 结果点击跳转（事件委托）
