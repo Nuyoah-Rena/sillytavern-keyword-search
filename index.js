@@ -261,11 +261,176 @@ async function getCharBoundWorldItems(ch) {
     return out;
 }
 
+/* ============================================================
+ * 聊天标签提取 / 扫描 / 简繁转换辅助
+ * ========================================================== */
+
+const CHAT_HTML_TAGS = new Set([
+    'a', 'abbr', 'address', 'area', 'article', 'aside', 'audio', 'b', 'base', 'bdi', 'bdo', 'blockquote',
+    'body', 'br', 'button', 'canvas', 'caption', 'cite', 'code', 'col', 'colgroup', 'data', 'datalist',
+    'dd', 'del', 'details', 'dfn', 'dialog', 'div', 'dl', 'dt', 'em', 'embed', 'fieldset', 'figcaption',
+    'figure', 'font', 'footer', 'form', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'head', 'header', 'hr',
+    'html', 'i', 'iframe', 'img', 'input', 'ins', 'kbd', 'label', 'legend', 'li', 'link', 'main', 'map',
+    'mark', 'meta', 'meter', 'nav', 'noscript', 'object', 'ol', 'optgroup', 'option', 'output', 'p',
+    'param', 'picture', 'pre', 'progress', 'q', 'rp', 'rt', 'ruby', 's', 'samp', 'script', 'section',
+    'select', 'slot', 'small', 'source', 'span', 'strike', 'strong', 'style', 'sub', 'summary', 'sup',
+    'svg', 'table', 'tbody', 'td', 'template', 'textarea', 'tfoot', 'th', 'thead', 'time', 'title',
+    'tr', 'track', 'u', 'ul', 'var', 'video', 'wbr', 'center',
+]);
+
+function normalizeChatTagName(raw) {
+    if (!raw || typeof raw !== 'string') return null;
+    const text = raw.trim().replace(/^<\/?/, '').replace(/\/?\s*>$/, '').trim();
+    const m = text.match(/^([\u4e00-\u9fa5a-zA-Z0-9_\-.]+)/);
+    if (!m) return null;
+    const tag = m[1].trim();
+    if (!tag || CHAT_HTML_TAGS.has(tag.toLowerCase())) return null;
+    return tag;
+}
+
+function parseChatTagRegex(str) {
+    const m = `${str || ''}`.trim().match(/^\/(.+)\/([a-z]*)$/);
+    if (!m) return null;
+    try {
+        const flags = m[2].includes('g') ? m[2] : (m[2] + 'g');
+        return new RegExp(m[1], flags);
+    } catch (e) { return null; }
+}
+
+function buildChatTagExtractor(tags) {
+    const list = Array.isArray(tags) ? tags.map(t => `${t}`.trim()).filter(Boolean) : [];
+    if (!list.length) return null;
+    const safeTags = [];
+    const customRegexes = [];
+    for (const raw of list) {
+        const rx = parseChatTagRegex(raw);
+        if (rx) { customRegexes.push(rx); continue; }
+        const clean = raw.replace(/^<\/?/, '').replace(/\/?\s*>$/, '').trim();
+        if (clean) safeTags.push(clean.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    }
+    const tagRe = safeTags.length
+        ? new RegExp(`<(${safeTags.join('|')})(?:\\s[^<>]*)?>([\\s\\S]*?)<\\/\\1>`, 'gi')
+        : null;
+    if (!tagRe && !customRegexes.length) return null;
+    return (text, isUser) => {
+        const raw = `${text || ''}`;
+        let parts = [];
+        if (tagRe) {
+            tagRe.lastIndex = 0;
+            let m;
+            while ((m = tagRe.exec(raw)) !== null) {
+                if (m[2]) parts.push(m[2]);
+            }
+        }
+        for (const rx of customRegexes) {
+            rx.lastIndex = 0;
+            let m;
+            while ((m = rx.exec(raw)) !== null) {
+                const seg = m.length > 1 ? m[1] : m[0];
+                if (seg) parts.push(seg);
+                if (m.index === rx.lastIndex) rx.lastIndex++;
+            }
+        }
+        if (parts.length) return parts.join('\n');
+        // 勾选了「用户发言」时，用户楼层通常不带正文标签，兜底搜索用户原话
+        return isUser ? raw : '';
+    };
+}
+
+function scanCurrentChatTags() {
+    const chat = (ctx().chat || []);
+    const stats = {};
+    const tokenRe = /<\/?([\u4e00-\u9fa5a-zA-Z0-9_\-.]+)(?:\s[^<>]*)?>/g;
+    for (const m of chat) {
+        const mes = m && m.mes ? `${m.mes}` : '';
+        if (!mes) continue;
+        tokenRe.lastIndex = 0;
+        let hit;
+        while ((hit = tokenRe.exec(mes)) !== null) {
+            const name = normalizeChatTagName(hit[1]);
+            if (!name) continue;
+            const k = name.toLowerCase();
+            if (!stats[k]) stats[k] = { name, count: 0 };
+            stats[k].count++;
+        }
+    }
+    return Object.values(stats)
+        .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name, 'zh-Hans-CN'))
+        .map(x => x.name);
+}
+
+// 按需懒加载 OpenCC-js（仅当取消勾选「区分简繁体」时才加载一次）
+let kwStConverter = null;
+let kwStLoading = null;
+
+function loadScriptWithTimeout(src, timeout = 7000) {
+    return new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        let done = false;
+        const timer = setTimeout(() => {
+            if (done) return;
+            done = true; s.remove(); reject(new Error('timeout'));
+        }, timeout);
+        s.src = src;
+        s.async = true;
+        s.onload = () => { if (!done) { done = true; clearTimeout(timer); resolve(); } };
+        s.onerror = () => { if (!done) { done = true; clearTimeout(timer); s.remove(); reject(new Error('load error')); } };
+        document.head.appendChild(s);
+    });
+}
+
+async function ensureStConverter(onProgress) {
+    if (kwStConverter) return kwStConverter;
+    if (kwStLoading) return kwStLoading;
+    kwStLoading = (async () => {
+        if (typeof window.OpenCC === 'undefined') {
+            onProgress && onProgress('首次加载简繁词库…');
+            const urls = [
+                'https://cdn.jsdelivr.net/npm/opencc-js@1.0.5/dist/umd/t2cn.js',
+                'https://unpkg.com/opencc-js@1.0.5/dist/umd/t2cn.js',
+                'https://cdn.jsdelivr.net/npm/opencc-js@1.0.5/dist/umd/full.js',
+            ];
+            let loaded = false;
+            for (const url of urls) {
+                try {
+                    await loadScriptWithTimeout(url);
+                    if (typeof window.OpenCC !== 'undefined') { loaded = true; break; }
+                } catch (e) { /* try next */ }
+            }
+            if (!loaded) return null;
+        }
+        const fns = [];
+        for (const from of ['hk', 'tw', 't']) {
+            try {
+                const fn = window.OpenCC.Converter({ from, to: 'cn' });
+                if (typeof fn === 'function') fns.push(fn);
+            } catch (e) { /* ignore */ }
+        }
+        if (!fns.length) return null;
+        kwStConverter = (text) => {
+            let out = `${text || ''}`;
+            for (const fn of fns) out = fn(out);
+            return out;
+        };
+        return kwStConverter;
+    })();
+    try { return await kwStLoading; }
+    finally { kwStLoading = null; }
+}
+
+function filterChatMessageContent(mes, isUser, chatOpts, extractor) {
+    if (!mes || !`${mes}`.trim()) return '';
+    if (isUser && chatOpts && chatOpts.includeUser === false) return '';
+    if (extractor) return extractor(mes, isUser);
+    return `${mes}`;
+}
+
 // 该角色的全部聊天存档（按消息，点击可跳到具体楼层；非当前存档会先打开）
-async function getCharacterChatItems(ch) {
+async function getCharacterChatItems(ch, chatOpts = {}) {
     if (!ch || !ch.avatar) return [];
     const c = ctx();
     const headers = typeof c.getRequestHeaders === 'function' ? c.getRequestHeaders() : {};
+    const extractor = buildChatTagExtractor(chatOpts.tags);
     const out = [];
     try {
         const listResp = await fetch('/api/characters/chats', { method: 'POST', headers, body: JSON.stringify({ avatar_url: ch.avatar }) });
@@ -279,12 +444,18 @@ async function getCharacterChatItems(ch) {
                     if (r.ok) {
                         const arr = await r.json();
                         const list = Array.isArray(arr) ? arr.slice() : [];
-                        if (list.length) list.shift(); // 首项是元数据
+                        if (list.length) list.shift();
                         list.forEach((m, i) => {
-                            const mes = m && m.mes ? `${m.mes}` : '';
+                            const rawMes = m && m.mes ? `${m.mes}` : '';
+                            const mes = filterChatMessageContent(rawMes, Boolean(m && m.is_user), chatOpts, extractor);
                             if (!mes.trim()) return;
                             const who = m.is_user ? (c.name1 || 'You') : (m.name || ch.name);
-                            out.push({ title: `${fileName} · #${i} ${who}`, content: mes, jump: { type: 'chatfile', file: fileName, mesid: i } });
+                            out.push({
+                                title: `${fileName} · #${i} ${who}`,
+                                content: mes,
+                                chatGroup: fileName,
+                                jump: { type: 'chatfile', file: fileName, mesid: i },
+                            });
                         });
                     }
                 } catch (e) { console.warn(`[${EXT_ID}] 取该角色聊天失败`, fileName, e); }
@@ -313,35 +484,38 @@ async function getAllCharacterFields(onProgress) {
     return out;
 }
 
-// 当前聊天记录
-function getChatMessages() {
+// 当前聊天记录（支持标签筛选 + 用户发言过滤）
+function getChatMessages(chatOpts = {}) {
     const c = ctx();
     const chat = c.chat || [];
-    return chat.map((m, i) => ({
-        title: `#${i} ${m.is_user ? (c.name1 || 'You') : (m.name || 'Char')}`,
-        content: `${m.mes || ''}`,
-        jump: { type: 'chat', mesid: i },
-    }));
+    const extractor = buildChatTagExtractor(chatOpts.tags);
+    const out = [];
+    chat.forEach((m, i) => {
+        const rawMes = m && m.mes ? `${m.mes}` : '';
+        const mes = filterChatMessageContent(rawMes, Boolean(m && m.is_user), chatOpts, extractor);
+        if (!mes.trim()) return;
+        out.push({
+            title: `#${i} ${m.is_user ? (c.name1 || 'You') : (m.name || 'Char')}`,
+            content: mes,
+            jump: { type: 'chat', mesid: i },
+        });
+    });
+    return out;
 }
 
-// 全部聊天记录（遍历所有角色 + 群组，逐文件从后端拉取）
-async function getAllChatItems(onProgress) {
+// 全部聊天记录（按角色/存档分楼层返回，点击可预览该楼层并一键切换跳转）
+async function getAllChatItems(onProgress, chatOpts = {}) {
     const c = ctx();
     const headers = typeof c.getRequestHeaders === 'function' ? c.getRequestHeaders() : {};
     const chars = c.characters || [];
     const groups = c.groups || [];
     const total = chars.length + groups.length;
+    const extractor = buildChatTagExtractor(chatOpts.tags);
     let done = 0;
     const out = [];
 
-    const flatten = (arr, dropFirst) => {
-        const list = Array.isArray(arr) ? arr.slice() : [];
-        if (dropFirst && list.length) list.shift(); // 单人聊天首项是元数据
-        return list.map(m => (m && m.mes ? `${m.mes}` : '')).filter(Boolean).join('\n');
-    };
-
-    // 角色聊天
-    for (const ch of chars) {
+    for (let chIndex = 0; chIndex < chars.length; chIndex++) {
+        const ch = chars[chIndex];
         if (ch && ch.avatar) {
             try {
                 const listResp = await fetch('/api/characters/chats', {
@@ -351,7 +525,6 @@ async function getAllChatItems(onProgress) {
                 if (listResp.ok) {
                     const data = await listResp.json();
                     const files = (data && data.error) ? [] : Object.values(data);
-                    // 同一角色的多个聊天文件并行拉取
                     await Promise.all(files.map(async (f) => {
                         const fileName = `${f.file_name}`.replace(/\.jsonl$/, '');
                         try {
@@ -360,8 +533,32 @@ async function getAllChatItems(onProgress) {
                                 body: JSON.stringify({ ch_name: ch.name, file_name: fileName, avatar_url: ch.avatar }),
                             });
                             if (r.ok) {
-                                const text = flatten(await r.json(), true);
-                                if (text.trim()) out.push({ title: `${ch.name} · ${fileName}`, content: text });
+                                const arr = await r.json();
+                                const list = Array.isArray(arr) ? arr.slice() : [];
+                                if (list.length) list.shift();
+                                const groupLabel = `${ch.name} · ${fileName}`;
+                                list.forEach((m, i) => {
+                                    const rawMes = m && m.mes ? `${m.mes}` : '';
+                                    const mes = filterChatMessageContent(rawMes, Boolean(m && m.is_user), chatOpts, extractor);
+                                    if (!mes.trim()) return;
+                                    const who = m.is_user ? (c.name1 || 'You') : (m.name || ch.name);
+                                    out.push({
+                                        title: `${groupLabel} · #${i} ${who}`,
+                                        content: mes,
+                                        chatGroup: groupLabel,
+                                        jump: {
+                                            type: 'chatAllFloor',
+                                            isGroup: false,
+                                            chIndex,
+                                            avatar: ch.avatar,
+                                            chName: ch.name,
+                                            file: fileName,
+                                            mesid: i,
+                                            who,
+                                            previewText: mes,
+                                        },
+                                    });
+                                });
                             }
                         } catch (e) { console.warn(`[${EXT_ID}] 取聊天失败`, ch.name, fileName, e); }
                     }));
@@ -371,7 +568,6 @@ async function getAllChatItems(onProgress) {
         onProgress && onProgress(++done, total);
     }
 
-    // 群组聊天
     for (const g of groups) {
         const files = Array.isArray(g.chats) ? g.chats : [];
         await Promise.all(files.map(async (fileName) => {
@@ -381,8 +577,30 @@ async function getAllChatItems(onProgress) {
                     body: JSON.stringify({ id: fileName }),
                 });
                 if (r.ok) {
-                    const text = flatten(await r.json(), false);
-                    if (text.trim()) out.push({ title: `[群] ${g.name} · ${fileName}`, content: text });
+                    const arr = await r.json();
+                    const list = Array.isArray(arr) ? arr.slice() : [];
+                    const groupLabel = `[群] ${g.name} · ${fileName}`;
+                    list.forEach((m, i) => {
+                        const rawMes = m && m.mes ? `${m.mes}` : '';
+                        const mes = filterChatMessageContent(rawMes, Boolean(m && m.is_user), chatOpts, extractor);
+                        if (!mes.trim()) return;
+                        const who = m.is_user ? (c.name1 || 'You') : (m.name || g.name);
+                        out.push({
+                            title: `${groupLabel} · #${i} ${who}`,
+                            content: mes,
+                            chatGroup: groupLabel,
+                            jump: {
+                                type: 'chatAllFloor',
+                                isGroup: true,
+                                groupId: g.id,
+                                groupName: g.name,
+                                file: fileName,
+                                mesid: i,
+                                who,
+                                previewText: mes,
+                            },
+                        });
+                    });
                 }
             } catch (e) { console.warn(`[${EXT_ID}] 取群聊失败`, g.name, fileName, e); }
         }));
@@ -403,35 +621,40 @@ function buildRegex(query, { caseSensitive, regex }) {
 }
 
 function scan(items, query, opts) {
+    const useSt = Boolean(opts && opts.stFold && typeof kwStConverter === 'function');
+    const effQuery = useSt ? kwStConverter(query) : query;
     let re;
-    try { re = buildRegex(query, opts); }
+    try { re = buildRegex(effQuery, opts || {}); }
     catch (e) { throw new Error('正则表达式无效: ' + e.message); }
 
     const results = [];
     let total = 0;
     for (const item of items) {
-        const text = item.content || '';
+        const rawText = item.content || '';
+        const text = useSt ? kwStConverter(rawText) : rawText;
+        const displayText = (useSt && text.length === rawText.length) ? rawText : text;
         re.lastIndex = 0;
         let m, count = 0;
         const snippets = [];
         while ((m = re.exec(text)) !== null) {
             count++;
-            if (m.index === re.lastIndex) re.lastIndex++; // 防零宽匹配死循环
+            if (m.index === re.lastIndex) re.lastIndex++;
             if (snippets.length < 3) {
                 const s = Math.max(0, m.index - 40);
-                const e = Math.min(text.length, m.index + m[0].length + 40);
+                const e = Math.min(displayText.length, m.index + m[0].length + 40);
                 snippets.push({
-                    before: text.slice(s, m.index),
-                    match: m[0],
-                    after: text.slice(m.index + m[0].length, e),
+                    before: displayText.slice(s, m.index),
+                    match: displayText.slice(m.index, m.index + m[0].length),
+                    after: displayText.slice(m.index + m[0].length, e),
                     truncStart: s > 0,
-                    truncEnd: e < text.length,
+                    truncEnd: e < displayText.length,
                 });
             }
         }
         if (count > 0) {
             total += count;
-            results.push({ title: item.title, count, snippets, jump: item.jump });
+            const jump = item.jump ? (useSt ? { ...item.jump, stFold: true } : item.jump) : undefined;
+            results.push({ title: item.title, count, snippets, jump, chatGroup: item.chatGroup });
         }
     }
     results.sort((a, b) => b.count - a.count);
@@ -447,6 +670,18 @@ async function runSearch(query, scopes, opts, onProgress) {
             content: it.keysText,
             jump: it.jump ? { ...it.jump, focusKey: true } : undefined,
         }));
+
+    const chatOpts = {
+        tags: Array.isArray(opts && opts.chatTags) ? opts.chatTags : [],
+        includeUser: !(opts && opts.chatIncludeUser === false),
+    };
+    const needChatScope = Boolean(scopes.chat || scopes.chatAll || scopes.char);
+    let chatScanOpts = opts;
+    if (needChatScope && opts && opts.chatCaseST === false) {
+        const conv = await ensureStConverter(onProgress);
+        if (conv) chatScanOpts = { ...opts, stFold: true };
+        else kwToast('简繁转换词库加载失败（网络受限），本次按原字搜索', 'warning');
+    }
 
     if (scopes.preset) {
         const allPrompts = getPresetPrompts().map((p, i) => ({ p, i })).filter(({ p }) => p && !p.marker);
@@ -487,19 +722,19 @@ async function runSearch(query, scopes, opts, onProgress) {
             groups.push({ label: '角色世界书 · 触发词', icon: 'fa-key', cat: 'wiKey', ...scan(toKeyItems(wItems), query, opts) });
         }
         onProgress && onProgress('扫描该角色聊天…');
-        const cItems = await getCharacterChatItems(ch);
-        if (cItems.length) groups.push({ label: '该角色聊天', icon: 'fa-comments', cat: 'chat', ...scan(cItems, query, opts) });
+        const cItems = await getCharacterChatItems(ch, chatOpts);
+        if (cItems.length) groups.push({ label: '该角色聊天', icon: 'fa-comments', cat: 'chat', groupByChat: true, ...scan(cItems, query, chatScanOpts) });
     }
     if (scopes.charAll) {
         const items = await getAllCharacterFields((d, t) => onProgress && onProgress(`加载角色卡 ${d}/${t}`));
         groups.push({ label: '全部角色卡', icon: 'fa-users', cat: 'char', ...scan(items, query, opts) });
     }
     if (scopes.chat) {
-        groups.push({ label: '当前聊天', icon: 'fa-comment', cat: 'chat', ...scan(getChatMessages(), query, opts) });
+        groups.push({ label: '当前聊天', icon: 'fa-comment', cat: 'chat', ...scan(getChatMessages(chatOpts), query, chatScanOpts) });
     }
     if (scopes.chatAll) {
-        const items = await getAllChatItems((d, t) => onProgress && onProgress(`扫描聊天 ${d}/${t}`));
-        groups.push({ label: '全部聊天', icon: 'fa-comments', cat: 'chat', ...scan(items, query, opts) });
+        const items = await getAllChatItems((d, t) => onProgress && onProgress(`扫描聊天 ${d}/${t}`), chatOpts);
+        groups.push({ label: '全部聊天', icon: 'fa-comments', cat: 'chat', groupByChat: true, ...scan(items, query, chatScanOpts) });
     }
     if (scopes.presetAll) {
         onProgress && onProgress('读取全部预设…');
@@ -589,6 +824,29 @@ const PANEL_HTML = `
     <label><input type="checkbox" data-scope="charAll"> 全部角色卡</label>
     <label><input type="checkbox" data-scope="chatAll"> 全部聊天</label>
     <span class="kwsearch-hint">扫描磁盘，较慢</span>
+  </div>
+  <div class="kwsearch-chatfilter" hidden>
+    <div class="kwcf-head">
+      <span class="kwcf-title"><i class="fa-solid fa-tags"></i> 聊天筛选</span>
+      <div class="kwcf-checks">
+        <label><input type="checkbox" class="kws-chat-user" checked> 用户发言</label>
+        <label title="取消勾选后同时匹配简体与繁体"><input type="checkbox" class="kws-chat-st" checked> 区分简繁体</label>
+      </div>
+    </div>
+    <div class="kwcf-row">
+      <input type="text" class="kws-chat-tag-inp" placeholder="限定标签(如 content) 或 /正则/，空格/回车添加" />
+      <button type="button" class="kwcf-icon-btn kws-chat-tag-scan" title="扫描当前聊天中的标签"><i class="fa-solid fa-wand-magic-sparkles"></i></button>
+      <button type="button" class="kwcf-icon-btn kws-chat-tag-del" title="橡皮擦模式（点击已选标签删除）"><i class="fa-solid fa-eraser"></i></button>
+      <button type="button" class="kwcf-icon-btn kws-chat-tag-clear" title="清空已选标签"><i class="fa-solid fa-trash-can"></i></button>
+    </div>
+    <div class="kwcf-box kws-chat-tags-selected" hidden>
+      <span class="kwcf-sub">已选：</span>
+      <div class="kwcf-chips kws-chat-selected-list"></div>
+    </div>
+    <div class="kwcf-box kws-chat-tags-detected" hidden>
+      <span class="kwcf-sub">扫描到：</span>
+      <div class="kwcf-chips kws-chat-detected-list"></div>
+    </div>
   </div>
   <div class="kwsearch-opts">
     <label><input type="checkbox" class="kws-case"> 区分大小写</label>
@@ -763,6 +1021,34 @@ function renderResults(panel, groups, query) {
                   <div class="kwsearch-wb-body">`;
                 const prefix = `${bk.book} · `;
                 for (const r of bk.items) {
+                    const dispTitle = r.title.startsWith(prefix) ? r.title.slice(prefix.length) : r.title;
+                    html += renderItemCard(r, dispTitle);
+                }
+                html += `</div></div>`;
+            }
+                } else if (g.groupByChat) {
+            const chatMap = new Map();
+            for (const r of g.results) {
+                const gName = r.chatGroup
+                    || (r.title.includes(' · #') ? r.title.slice(0, r.title.indexOf(' · #')) : '聊天记录');
+                if (!chatMap.has(gName)) chatMap.set(gName, { name: gName, total: 0, items: [] });
+                const cg = chatMap.get(gName);
+                cg.total += r.count;
+                cg.items.push(r);
+            }
+            const chatGroups = Array.from(chatMap.values()).sort((a, b) => b.total - a.total);
+            for (const cg of chatGroups) {
+                html += `<div class="kwsearch-wb-card">
+                  <div class="kwsearch-wb-head" title="点击展开或收起该聊天存档">
+                    <span class="kwsearch-wb-name"><i class="fa-solid fa-comments"></i> ${esc(cg.name)}</span>
+                    <span class="kwsearch-wb-meta">
+                      <span class="kwsearch-wb-badge">${cg.total} 次 / ${cg.items.length} 楼</span>
+                      <i class="fa-solid fa-chevron-down kwsearch-wb-chev"></i>
+                    </span>
+                  </div>
+                  <div class="kwsearch-wb-body">`;
+                const prefix = `${cg.name} · `;
+                for (const r of cg.items) {
                     const dispTitle = r.title.startsWith(prefix) ? r.title.slice(prefix.length) : r.title;
                     html += renderItemCard(r, dispTitle);
                 }
@@ -1247,10 +1533,17 @@ async function doSearch(panel) {
     const scopes = {};
     panel.querySelectorAll('[data-scope]').forEach(cb => { scopes[cb.dataset.scope] = cb.checked; });
     scopes.worldOneBook = panel.querySelector('.kws-world-pick') ? panel.querySelector('.kws-world-pick').value : '';
-    const opts = {
-        caseSensitive: panel.querySelector('.kws-case').checked,
-        regex: panel.querySelector('.kws-regex').checked,
-    };
+     const chatTagPending = panel.querySelector('.kws-chat-tag-inp')
+     ? panel.querySelector('.kws-chat-tag-inp').value.split(/[,，\s]+/).map(s => s.trim()).filter(Boolean)
+     : [];
+ const chatTags = [...new Set([...(panel._kwChatTags || []), ...chatTagPending])];
+ const opts = {
+     caseSensitive: panel.querySelector('.kws-case').checked,
+     regex: panel.querySelector('.kws-regex').checked,
+     chatTags,
+     chatIncludeUser: panel.querySelector('.kws-chat-user') ? panel.querySelector('.kws-chat-user').checked : true,
+     chatCaseST: panel.querySelector('.kws-chat-st') ? panel.querySelector('.kws-chat-st').checked : true,
+ };
 
     const summary = panel.querySelector('.kwsearch-summary');
     const goBtn = panel.querySelector('.kws-go');
@@ -1295,12 +1588,18 @@ function renderHistory(panel) {
 function applyScopes(panel, scopes, opts) {
     if (scopes) {
         panel.querySelectorAll('[data-scope]').forEach(cb => {
+            if (cb.dataset.scope.startsWith('regex')) {
+                cb.checked = false;
+                return;
+            }
             if (Object.prototype.hasOwnProperty.call(scopes, cb.dataset.scope)) cb.checked = !!scopes[cb.dataset.scope];
         });
     }
     if (opts) {
         const cs = panel.querySelector('.kws-case'); if (cs) cs.checked = !!opts.caseSensitive;
         const rg = panel.querySelector('.kws-regex'); if (rg) rg.checked = !!opts.regex;
+        const cu = panel.querySelector('.kws-chat-user'); if (cu && opts.chatIncludeUser !== undefined) cu.checked = !!opts.chatIncludeUser;
+        const cst = panel.querySelector('.kws-chat-st'); if (cst && opts.chatCaseST !== undefined) cst.checked = !!opts.chatCaseST;
     }
 }
 
@@ -1369,6 +1668,7 @@ async function doJump(jump) {
     switch (jump.type) {
         case 'chat': return jumpChat(jump.mesid);
         case 'chatfile': return jumpChatFile(jump.file, jump.mesid);
+        case 'chatAllFloor': return jumpChatAllFloor(jump);
         case 'wi': return jumpWorldInfo(jump.book, jump.uid, Boolean(jump.focusKey));
         case 'preset': return jumpPreset(jump.identifier, jump.name, jump.idx, jump.hlMode);
         case 'presetAll': return jumpPresetGlobal(jump);
@@ -1468,6 +1768,91 @@ async function jumpChatFile(file, mesid) {
         return jumpChat(mesid);
     }
     kwToast('已打开该聊天存档（未定位到具体楼层）', 'info');
+}
+async function jumpChatAllFloor(jump) {
+    const c = ctx();
+    const curChar = (c.characters || [])[c.characterId];
+    const curChat = (typeof c.getCurrentChatId === 'function') ? c.getCurrentChatId() : null;
+    // 如果刚好就是当前角色的当前聊天，直接 /chat-jump 跳过去
+    if (!jump.isGroup && curChar && curChar.avatar === jump.avatar && curChat === jump.file) {
+        return jumpChat(jump.mesid);
+    }
+    return showChatFloorViewer(jump);
+}
+
+function showChatFloorViewer(jump) {
+    const c = ctx();
+    const text = `${jump.previewText || ''}`;
+    const hlOpts = jump.stFold ? { ...kwLastOpts, stFold: true } : kwLastOpts;
+    const headTitle = jump.isGroup ? `[群] ${jump.groupName} · ${jump.file}` : `${jump.chName} · ${jump.file}`;
+    const canSwitch = (!jump.isGroup && typeof c.selectCharacterById === 'function')
+        || (jump.isGroup && typeof c.openGroupById === 'function');
+
+    const html = `<div class="kwsearch-panel kwv-panel" data-theme="${esc(resolveTheme(getTheme()))}">
+      <div class="kwsearch-glass">
+        <div class="kwv-head">
+          <span class="kwv-preset"><i class="fa-solid fa-comments"></i> ${esc(headTitle)}</span>
+          <span class="kwv-name">#${jump.mesid} ${esc(jump.who || '')}</span>
+          <button class="kwv-close" title="关闭"><i class="fa-solid fa-xmark"></i></button>
+        </div>
+        <div class="kwv-body">${text ? highlightHtml(text, kwLastQuery, hlOpts) : '<span class="kwv-empty">（该楼层无正文内容）</span>'}</div>
+        ${canSwitch ? `<div class="kwv-actions">
+          <button class="kwv-switch"><i class="fa-solid fa-arrow-right-to-bracket"></i> 切换到此聊天并跳转至 #${jump.mesid} 楼</button>
+        </div>` : ''}
+      </div>
+    </div>`;
+
+    try {
+        c.callGenericPopup(html, c.POPUP_TYPE.TEXT, '', { wide: true, large: true, allowVerticalScrolling: true, okButton: '关闭' });
+    } catch (e) {
+        console.warn(`[${EXT_ID}] 打开聊天楼层预览失败`, e);
+        kwToast('打开楼层预览失败', 'warning');
+        return;
+    }
+    setTimeout(() => {
+        const sw = document.querySelector('.kwv-switch');
+        const cl = document.querySelector('.kwv-close');
+        const closePopup = (el) => {
+            const dlg = el && el.closest('dialog');
+            const ok = dlg && (dlg.querySelector('.popup-button-ok') || dlg.querySelector('.popup-button-close'));
+            if (ok) ok.click();
+        };
+        if (cl) cl.addEventListener('click', () => closePopup(cl), { once: true });
+        if (sw) sw.addEventListener('click', async () => {
+            closePopup(sw);
+            await switchAndJumpChatFloor(jump);
+        }, { once: true });
+    }, 60);
+}
+
+async function switchAndJumpChatFloor(jump) {
+    const c = ctx();
+    try {
+        if (jump.isGroup) {
+            if (typeof c.openGroupById === 'function') {
+                await c.openGroupById(jump.groupId);
+                await waitFor(() => document.querySelector('.mes[mesid]'), 5000);
+                await new Promise(r => setTimeout(r, 200));
+                return jumpChat(jump.mesid);
+            }
+            kwToast('当前版本暂不支持自动切换群聊，请手动进入后使用 /chat-jump', 'info');
+            return;
+        }
+        const chars = c.characters || [];
+        let chIdx = (chars[jump.chIndex] && chars[jump.chIndex].avatar === jump.avatar)
+            ? jump.chIndex
+            : chars.findIndex(x => x && x.avatar === jump.avatar);
+        if (chIdx < 0) { kwToast(`未找到角色：${jump.chName}`, 'warning'); return; }
+        if (Number(c.characterId) !== chIdx) {
+            await c.selectCharacterById(chIdx);
+            await waitFor(() => Number(ctx().characterId) === chIdx, 5000);
+            await new Promise(r => setTimeout(r, 250));
+        }
+        return jumpChatFile(jump.file, jump.mesid);
+    } catch (e) {
+        console.warn(`[${EXT_ID}] 切换并跳转聊天失败`, e);
+        kwToast('切换聊天失败，请手动切换后跳转', 'warning');
+    }
 }
 
 /* ---------- 世界书增强跳转：独立卡片 + 高亮脉冲 + 关键词标黄 ---------- */
@@ -1680,6 +2065,78 @@ function ensureWiEnhanceStyle() {
         }
         .kwsearch-wb-body > .kwsearch-item:last-child {
             margin-bottom: 0 !important;
+        }
+        /* 预览卡片统一高度：iPhone 上约 2.5cm（锁死 flex 防止聊天/短卡片长短不一） */
+        .kwsearch-results .kwsearch-item {
+            height: 150px !important;
+            min-height: 150px !important;
+            max-height: 150px !important;
+            flex: 0 0 150px !important;
+            overflow-y: auto !important;
+            box-sizing: border-box !important;
+            overscroll-behavior: auto;
+            -webkit-overflow-scrolling: touch;
+        }
+        /* 只选中「世界书触发词」时卡片高度：约 1.5cm */
+        .kwsearch-panel.kw-only-wikey .kwsearch-results .kwsearch-item {
+            height: 90px !important;
+            min-height: 90px !important;
+            max-height: 90px !important;
+            flex: 0 0 90px !important;
+        }
+        /* 聊天按标签筛选区域 */
+        .kwsearch-chatfilter {
+            margin: 6px 0 8px; padding: 8px 10px; border-radius: 10px;
+            border: 1px solid color-mix(in srgb, currentColor 18%, transparent);
+            background: color-mix(in srgb, currentColor 4%, transparent);
+            display: flex; flex-direction: column; gap: 6px; font-size: 12.5px;
+        }
+        .kwsearch-chatfilter[hidden] { display: none !important; }
+        .kwcf-head {
+            display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap;
+        }
+        .kwcf-title { font-weight: 600; display: inline-flex; align-items: center; gap: 5px; }
+        .kwcf-checks { display: inline-flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+        .kwcf-checks label { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; margin: 0; }
+        .kwcf-row { display: flex; align-items: center; gap: 5px; }
+        .kws-chat-tag-inp {
+            flex: 1; min-width: 0; height: 30px; padding: 4px 8px; border-radius: 7px; font-size: 12px;
+            border: 1px solid color-mix(in srgb, currentColor 22%, transparent);
+            background: color-mix(in srgb, currentColor 5%, transparent); color: inherit; box-sizing: border-box;
+        }
+        .kwcf-icon-btn {
+            flex-shrink: 0; width: 30px; height: 30px; border-radius: 7px; cursor: pointer;
+            border: 1px solid color-mix(in srgb, currentColor 22%, transparent);
+            background: color-mix(in srgb, currentColor 6%, transparent); color: inherit;
+            display: inline-flex; align-items: center; justify-content: center; font-size: 12px;
+        }
+        .kwcf-icon-btn.on {
+            background: color-mix(in srgb, var(--kw-wi-accent) 26%, transparent);
+            border-color: var(--kw-wi-accent);
+        }
+        .kwcf-icon-btn.del-on {
+            background: rgba(217, 83, 79, 0.24); border-color: rgba(217, 83, 79, 0.8); color: #d9534f;
+        }
+        .kwcf-box {
+            display: flex; align-items: flex-start; gap: 6px; padding: 5px 7px; border-radius: 7px;
+            border: 1px dashed color-mix(in srgb, currentColor 18%, transparent);
+            background: color-mix(in srgb, currentColor 3%, transparent);
+        }
+        .kwcf-box[hidden] { display: none !important; }
+        .kwcf-sub { flex-shrink: 0; font-size: 11.5px; opacity: 0.72; padding-top: 2px; }
+        .kwcf-chips { display: flex; flex-wrap: wrap; gap: 4px; max-height: 84px; overflow-y: auto; flex: 1; }
+        .kwcf-chip {
+            padding: 2px 7px; border-radius: 5px; font-size: 11.5px; cursor: pointer;
+            border: 1px solid color-mix(in srgb, var(--kw-wi-accent) 55%, transparent);
+            background: color-mix(in srgb, var(--kw-wi-accent) 16%, transparent);
+            user-select: none; -webkit-user-select: none;
+        }
+        .kwcf-chip.detected {
+            border-color: color-mix(in srgb, currentColor 24%, transparent);
+            background: color-mix(in srgb, currentColor 8%, transparent);
+        }
+        .kwcf-chip.del-mode {
+            border-color: rgba(217, 83, 79, 0.72); background: rgba(217, 83, 79, 0.18);
         }
     `;
     document.head.appendChild(style);
@@ -2895,17 +3352,22 @@ async function jumpPreset(identifier, name, idx, hlMode = 'content') {
 // 把文本里的匹配高亮（转义安全）
 function highlightHtml(text, query, opts) {
     if (!query) return esc(text);
+    const useSt = Boolean(opts && opts.stFold && typeof kwStConverter === 'function');
+    const effQuery = useSt ? kwStConverter(query) : query;
+    const raw = `${text || ''}`;
+    const scanText = useSt ? kwStConverter(raw) : raw;
+    const dispText = (useSt && scanText.length === raw.length) ? raw : scanText;
     let re;
-    try { re = buildRegex(query, opts || {}); } catch (e) { return esc(text); }
+    try { re = buildRegex(effQuery, opts || {}); } catch (e) { return esc(raw); }
     re.lastIndex = 0;
     let out = '', last = 0, m, guard = 0;
-    while ((m = re.exec(text)) !== null && guard++ < 8000) {
+    while ((m = re.exec(scanText)) !== null && guard++ < 8000) {
         if (m.index < last) { re.lastIndex = last + 1; continue; }
-        out += esc(text.slice(last, m.index)) + '<mark>' + esc(m[0]) + '</mark>';
+        out += esc(dispText.slice(last, m.index)) + '<mark>' + esc(dispText.slice(m.index, m.index + m[0].length)) + '</mark>';
         last = m.index + (m[0].length || 0);
         if (m[0].length === 0) re.lastIndex++;
     }
-    out += esc(text.slice(last));
+    out += esc(dispText.slice(last));
     return out;
 }
 
@@ -3168,7 +3630,9 @@ function buildPanel(prefill) {
         regexToggle.classList.toggle('on', !regexRow.hidden);
         regexToggle.setAttribute('aria-expanded', String(!regexRow.hidden));
     };
-    if (regexRow.querySelector('[data-scope]:checked')) regexRow.hidden = false;
+        // 默认关闭并折叠「正则脚本」
+    regexRow.querySelectorAll('[data-scope]').forEach(cb => { cb.checked = false; });
+    regexRow.hidden = true;
     regexToggle.addEventListener('click', () => { regexRow.hidden = !regexRow.hidden; syncRegexToggle(); });
     syncRegexToggle();
     regexStore.availability().then(available => {
@@ -3251,6 +3715,90 @@ function buildPanel(prefill) {
         };
         worldOneCb.addEventListener('change', syncWorldPick);
         syncWorldPick();
+    }
+
+    // 聊天按标签筛选 + 用户发言 + 区分简繁体（勾选当前聊天 / 全部聊天 / 当前角色卡时自动显示）
+    const chatFilterRow = panel.querySelector('.kwsearch-chatfilter');
+    if (chatFilterRow) {
+        panel._kwChatTags = (last && last.opts && Array.isArray(last.opts.chatTags)) ? [...last.opts.chatTags] : [];
+        let chatDelMode = false;
+        const tagInp = chatFilterRow.querySelector('.kws-chat-tag-inp');
+        const scanBtn = chatFilterRow.querySelector('.kws-chat-tag-scan');
+        const delBtn = chatFilterRow.querySelector('.kws-chat-tag-del');
+        const clrBtn = chatFilterRow.querySelector('.kws-chat-tag-clear');
+        const selBox = chatFilterRow.querySelector('.kws-chat-tags-selected');
+        const selList = chatFilterRow.querySelector('.kws-chat-selected-list');
+        const detBox = chatFilterRow.querySelector('.kws-chat-tags-detected');
+        const detList = chatFilterRow.querySelector('.kws-chat-detected-list');
+
+        const renderChatTags = () => {
+            selBox.hidden = panel._kwChatTags.length === 0;
+            selList.innerHTML = panel._kwChatTags.map((t, i) =>
+                `<span class="kwcf-chip${chatDelMode ? ' del-mode' : ''}" data-ti="${i}">${esc(t)}</span>`
+            ).join('');
+        };
+        const addChatTags = (raw) => {
+            const parts = `${raw || ''}`.split(/[,，\s]+/).map(s => s.trim()).filter(Boolean);
+            let changed = false;
+            for (const p of parts) {
+                if (!panel._kwChatTags.includes(p)) { panel._kwChatTags.push(p); changed = true; }
+            }
+            if (changed) renderChatTags();
+        };
+        const syncChatFilterVis = () => {
+            const show = ['chat', 'chatAll', 'char'].some(k => {
+                const cb = panel.querySelector(`[data-scope="${k}"]`);
+                return cb && cb.checked;
+            });
+            chatFilterRow.hidden = !show;
+        };
+
+        ['chat', 'chatAll', 'char'].forEach(k => {
+            const cb = panel.querySelector(`[data-scope="${k}"]`);
+            if (cb) cb.addEventListener('change', syncChatFilterVis);
+        });
+        tagInp.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ' || e.key === ',' || e.key === '，') {
+                e.preventDefault();
+                if (tagInp.value.trim()) { addChatTags(tagInp.value); tagInp.value = ''; }
+            }
+        });
+        delBtn.addEventListener('click', () => {
+            chatDelMode = !chatDelMode;
+            delBtn.classList.toggle('del-on', chatDelMode);
+            renderChatTags();
+        });
+        clrBtn.addEventListener('click', () => {
+            panel._kwChatTags = [];
+            tagInp.value = '';
+            renderChatTags();
+        });
+        selList.addEventListener('click', (e) => {
+            const chip = e.target.closest('.kwcf-chip[data-ti]');
+            if (!chip || !chatDelMode) return;
+            panel._kwChatTags.splice(Number(chip.dataset.ti), 1);
+            renderChatTags();
+        });
+        scanBtn.addEventListener('click', () => {
+            if (!detBox.hidden) {
+                detBox.hidden = true;
+                scanBtn.classList.remove('on');
+                return;
+            }
+            const tags = scanCurrentChatTags();
+            detList.innerHTML = tags.length
+                ? tags.map(t => `<span class="kwcf-chip detected" data-dt="${esc(t)}">${esc(t)}</span>`).join('')
+                : '<span style="opacity:.6;font-size:11.5px;">当前聊天未检测到自定义标签</span>';
+            detBox.hidden = false;
+            scanBtn.classList.add('on');
+        });
+        detList.addEventListener('click', (e) => {
+            const chip = e.target.closest('.kwcf-chip[data-dt]');
+            if (chip) addChatTags(chip.dataset.dt);
+        });
+
+        renderChatTags();
+        syncChatFilterVis();
     }
 
  // 分类标签卡筛选（支持多选叠加 + 点击数字右侧灰色叉叉隐藏该分类）
