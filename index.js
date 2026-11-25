@@ -425,7 +425,23 @@ function filterChatMessageContent(mes, isUser, chatOpts, extractor) {
     return `${mes}`;
 }
 
-// 该角色的全部聊天存档（按消息，点击可跳到具体楼层；非当前存档会先打开）
+// 提取某楼层中「除当前显示版本之外」的所有历史 Swipe
+function getOtherSwipes(m, activeRaw) {
+    if (!m || !Array.isArray(m.swipes) || m.swipes.length <= 1) return [];
+    const total = m.swipes.length;
+    const activeIdx = (typeof m.swipe_id === 'number' && m.swipe_id >= 0 && m.swipe_id < total)
+        ? m.swipe_id
+        : m.swipes.indexOf(activeRaw);
+    const out = [];
+    for (let sIdx = 0; sIdx < total; sIdx++) {
+        if (sIdx === activeIdx) continue;
+        const text = typeof m.swipes[sIdx] === 'string' ? m.swipes[sIdx] : '';
+        if (text.trim()) out.push({ sIdx, total, text });
+    }
+    return out;
+}
+
+// 该角色的全部聊天存档（支持标签 / 用户发言 / 历史 Swipe）
 async function getCharacterChatItems(ch, chatOpts = {}) {
     if (!ch || !ch.avatar) return [];
     const c = ctx();
@@ -446,16 +462,38 @@ async function getCharacterChatItems(ch, chatOpts = {}) {
                         const list = Array.isArray(arr) ? arr.slice() : [];
                         if (list.length) list.shift();
                         list.forEach((m, i) => {
+                            const isUser = Boolean(m && m.is_user);
+                            const who = isUser ? (c.name1 || 'You') : (m.name || ch.name);
                             const rawMes = m && m.mes ? `${m.mes}` : '';
-                            const mes = filterChatMessageContent(rawMes, Boolean(m && m.is_user), chatOpts, extractor);
-                            if (!mes.trim()) return;
-                            const who = m.is_user ? (c.name1 || 'You') : (m.name || ch.name);
-                            out.push({
-                                title: `${fileName} · #${i} ${who}`,
-                                content: mes,
-                                chatGroup: fileName,
-                                jump: { type: 'chatfile', file: fileName, mesid: i },
-                            });
+                            const mes = filterChatMessageContent(rawMes, isUser, chatOpts, extractor);
+                            if (mes.trim()) {
+                                out.push({
+                                    title: `${fileName} · #${i} ${who}`,
+                                    content: mes,
+                                    chatGroup: fileName,
+                                    jump: { type: 'chatfile', file: fileName, mesid: i },
+                                });
+                            }
+                            if (chatOpts.includeSwipes) {
+                                for (const sw of getOtherSwipes(m, rawMes)) {
+                                    const swText = filterChatMessageContent(sw.text, isUser, chatOpts, extractor);
+                                    if (!swText.trim()) continue;
+                                    out.push({
+                                        title: `${fileName} · #${i} ${who} [Swipe ${sw.sIdx + 1}/${sw.total}]`,
+                                        content: swText,
+                                        chatGroup: fileName,
+                                        jump: {
+                                            type: 'chatSwipe',
+                                            file: fileName,
+                                            mesid: i,
+                                            swipeIdx: sw.sIdx,
+                                            swipeTotal: sw.total,
+                                            who,
+                                            previewText: swText,
+                                        },
+                                    });
+                                }
+                            }
                         });
                     }
                 } catch (e) { console.warn(`[${EXT_ID}] 取该角色聊天失败`, fileName, e); }
@@ -484,26 +522,47 @@ async function getAllCharacterFields(onProgress) {
     return out;
 }
 
-// 当前聊天记录（支持标签筛选 + 用户发言过滤）
+// 当前聊天记录（支持标签筛选 + 用户发言过滤 + 历史 Swipe）
 function getChatMessages(chatOpts = {}) {
     const c = ctx();
     const chat = c.chat || [];
     const extractor = buildChatTagExtractor(chatOpts.tags);
     const out = [];
     chat.forEach((m, i) => {
+        const isUser = Boolean(m && m.is_user);
+        const who = isUser ? (c.name1 || 'You') : (m.name || 'Char');
         const rawMes = m && m.mes ? `${m.mes}` : '';
-        const mes = filterChatMessageContent(rawMes, Boolean(m && m.is_user), chatOpts, extractor);
-        if (!mes.trim()) return;
-        out.push({
-            title: `#${i} ${m.is_user ? (c.name1 || 'You') : (m.name || 'Char')}`,
-            content: mes,
-            jump: { type: 'chat', mesid: i },
-        });
+        const mes = filterChatMessageContent(rawMes, isUser, chatOpts, extractor);
+        if (mes.trim()) {
+            out.push({
+                title: `#${i} ${who}`,
+                content: mes,
+                jump: { type: 'chat', mesid: i },
+            });
+        }
+        if (chatOpts.includeSwipes) {
+            for (const sw of getOtherSwipes(m, rawMes)) {
+                const swText = filterChatMessageContent(sw.text, isUser, chatOpts, extractor);
+                if (!swText.trim()) continue;
+                out.push({
+                    title: `#${i} ${who} [Swipe ${sw.sIdx + 1}/${sw.total}]`,
+                    content: swText,
+                    jump: {
+                        type: 'chatSwipe',
+                        mesid: i,
+                        swipeIdx: sw.sIdx,
+                        swipeTotal: sw.total,
+                        who,
+                        previewText: swText,
+                    },
+                });
+            }
+        }
     });
     return out;
 }
 
-// 全部聊天记录（按角色/存档分楼层返回，点击可预览该楼层并一键切换跳转）
+// 全部聊天记录（按角色/存档分楼层返回，支持历史 Swipe）
 async function getAllChatItems(onProgress, chatOpts = {}) {
     const c = ctx();
     const headers = typeof c.getRequestHeaders === 'function' ? c.getRequestHeaders() : {};
@@ -538,26 +597,52 @@ async function getAllChatItems(onProgress, chatOpts = {}) {
                                 if (list.length) list.shift();
                                 const groupLabel = `${ch.name} · ${fileName}`;
                                 list.forEach((m, i) => {
+                                    const isUser = Boolean(m && m.is_user);
+                                    const who = isUser ? (c.name1 || 'You') : (m.name || ch.name);
                                     const rawMes = m && m.mes ? `${m.mes}` : '';
-                                    const mes = filterChatMessageContent(rawMes, Boolean(m && m.is_user), chatOpts, extractor);
-                                    if (!mes.trim()) return;
-                                    const who = m.is_user ? (c.name1 || 'You') : (m.name || ch.name);
-                                    out.push({
-                                        title: `${groupLabel} · #${i} ${who}`,
-                                        content: mes,
-                                        chatGroup: groupLabel,
-                                        jump: {
-                                            type: 'chatAllFloor',
-                                            isGroup: false,
-                                            chIndex,
-                                            avatar: ch.avatar,
-                                            chName: ch.name,
-                                            file: fileName,
-                                            mesid: i,
-                                            who,
-                                            previewText: mes,
-                                        },
-                                    });
+                                    const mes = filterChatMessageContent(rawMes, isUser, chatOpts, extractor);
+                                    if (mes.trim()) {
+                                        out.push({
+                                            title: `${groupLabel} · #${i} ${who}`,
+                                            content: mes,
+                                            chatGroup: groupLabel,
+                                            jump: {
+                                                type: 'chatAllFloor',
+                                                isGroup: false,
+                                                chIndex,
+                                                avatar: ch.avatar,
+                                                chName: ch.name,
+                                                file: fileName,
+                                                mesid: i,
+                                                who,
+                                                previewText: mes,
+                                            },
+                                        });
+                                    }
+                                    if (chatOpts.includeSwipes) {
+                                        for (const sw of getOtherSwipes(m, rawMes)) {
+                                            const swText = filterChatMessageContent(sw.text, isUser, chatOpts, extractor);
+                                            if (!swText.trim()) continue;
+                                            out.push({
+                                                title: `${groupLabel} · #${i} ${who} [Swipe ${sw.sIdx + 1}/${sw.total}]`,
+                                                content: swText,
+                                                chatGroup: groupLabel,
+                                                jump: {
+                                                    type: 'chatAllFloor',
+                                                    isGroup: false,
+                                                    chIndex,
+                                                    avatar: ch.avatar,
+                                                    chName: ch.name,
+                                                    file: fileName,
+                                                    mesid: i,
+                                                    swipeIdx: sw.sIdx,
+                                                    swipeTotal: sw.total,
+                                                    who,
+                                                    previewText: swText,
+                                                },
+                                            });
+                                        }
+                                    }
                                 });
                             }
                         } catch (e) { console.warn(`[${EXT_ID}] 取聊天失败`, ch.name, fileName, e); }
@@ -581,25 +666,50 @@ async function getAllChatItems(onProgress, chatOpts = {}) {
                     const list = Array.isArray(arr) ? arr.slice() : [];
                     const groupLabel = `[群] ${g.name} · ${fileName}`;
                     list.forEach((m, i) => {
+                        const isUser = Boolean(m && m.is_user);
+                        const who = isUser ? (c.name1 || 'You') : (m.name || g.name);
                         const rawMes = m && m.mes ? `${m.mes}` : '';
-                        const mes = filterChatMessageContent(rawMes, Boolean(m && m.is_user), chatOpts, extractor);
-                        if (!mes.trim()) return;
-                        const who = m.is_user ? (c.name1 || 'You') : (m.name || g.name);
-                        out.push({
-                            title: `${groupLabel} · #${i} ${who}`,
-                            content: mes,
-                            chatGroup: groupLabel,
-                            jump: {
-                                type: 'chatAllFloor',
-                                isGroup: true,
-                                groupId: g.id,
-                                groupName: g.name,
-                                file: fileName,
-                                mesid: i,
-                                who,
-                                previewText: mes,
-                            },
-                        });
+                        const mes = filterChatMessageContent(rawMes, isUser, chatOpts, extractor);
+                        if (mes.trim()) {
+                            out.push({
+                                title: `${groupLabel} · #${i} ${who}`,
+                                content: mes,
+                                chatGroup: groupLabel,
+                                jump: {
+                                    type: 'chatAllFloor',
+                                    isGroup: true,
+                                    groupId: g.id,
+                                    groupName: g.name,
+                                    file: fileName,
+                                    mesid: i,
+                                    who,
+                                    previewText: mes,
+                                },
+                            });
+                        }
+                        if (chatOpts.includeSwipes) {
+                            for (const sw of getOtherSwipes(m, rawMes)) {
+                                const swText = filterChatMessageContent(sw.text, isUser, chatOpts, extractor);
+                                if (!swText.trim()) continue;
+                                out.push({
+                                    title: `${groupLabel} · #${i} ${who} [Swipe ${sw.sIdx + 1}/${sw.total}]`,
+                                    content: swText,
+                                    chatGroup: groupLabel,
+                                    jump: {
+                                        type: 'chatAllFloor',
+                                        isGroup: true,
+                                        groupId: g.id,
+                                        groupName: g.name,
+                                        file: fileName,
+                                        mesid: i,
+                                        swipeIdx: sw.sIdx,
+                                        swipeTotal: sw.total,
+                                        who,
+                                        previewText: swText,
+                                    },
+                                });
+                            }
+                        }
                     });
                 }
             } catch (e) { console.warn(`[${EXT_ID}] 取群聊失败`, g.name, fileName, e); }
@@ -674,6 +784,7 @@ async function runSearch(query, scopes, opts, onProgress) {
     const chatOpts = {
         tags: Array.isArray(opts && opts.chatTags) ? opts.chatTags : [],
         includeUser: !(opts && opts.chatIncludeUser === false),
+        includeSwipes: Boolean(opts && opts.chatIncludeSwipes),
     };
     const needChatScope = Boolean(scopes.chat || scopes.chatAll || scopes.char);
     let chatScanOpts = opts;
@@ -831,6 +942,7 @@ const PANEL_HTML = `
       <div class="kwcf-checks">
         <label><input type="checkbox" class="kws-chat-user" checked> 用户发言</label>
         <label title="取消勾选后同时匹配简体与繁体"><input type="checkbox" class="kws-chat-st" checked> 区分简繁体</label>
+        <label title="同时搜索每楼层的其他 Swipe 备选回复"><input type="checkbox" class="kws-chat-swipes"> 包含Swipe</label>
       </div>
     </div>
     <div class="kwcf-row">
@@ -1543,6 +1655,8 @@ async function doSearch(panel) {
      chatTags,
      chatIncludeUser: panel.querySelector('.kws-chat-user') ? panel.querySelector('.kws-chat-user').checked : true,
      chatCaseST: panel.querySelector('.kws-chat-st') ? panel.querySelector('.kws-chat-st').checked : true,
+     chatIncludeSwipes: panel.querySelector('.kws-chat-swipes') ? panel.querySelector('.kws-chat-swipes').checked : false,
+
  };
 
     const summary = panel.querySelector('.kwsearch-summary');
@@ -1600,6 +1714,7 @@ function applyScopes(panel, scopes, opts) {
         const rg = panel.querySelector('.kws-regex'); if (rg) rg.checked = !!opts.regex;
         const cu = panel.querySelector('.kws-chat-user'); if (cu && opts.chatIncludeUser !== undefined) cu.checked = !!opts.chatIncludeUser;
         const cst = panel.querySelector('.kws-chat-st'); if (cst && opts.chatCaseST !== undefined) cst.checked = !!opts.chatCaseST;
+        const csw = panel.querySelector('.kws-chat-swipes'); if (csw && opts.chatIncludeSwipes !== undefined) csw.checked = !!opts.chatIncludeSwipes;
     }
 }
 
@@ -1669,6 +1784,7 @@ async function doJump(jump) {
         case 'chat': return jumpChat(jump.mesid);
         case 'chatfile': return jumpChatFile(jump.file, jump.mesid);
         case 'chatAllFloor': return jumpChatAllFloor(jump);
+        case 'chatSwipe': return showChatFloorViewer(jump);
         case 'wi': return jumpWorldInfo(jump.book, jump.uid, Boolean(jump.focusKey));
         case 'preset': return jumpPreset(jump.identifier, jump.name, jump.idx, jump.hlMode);
         case 'presetAll': return jumpPresetGlobal(jump);
@@ -1773,8 +1889,7 @@ async function jumpChatAllFloor(jump) {
     const c = ctx();
     const curChar = (c.characters || [])[c.characterId];
     const curChat = (typeof c.getCurrentChatId === 'function') ? c.getCurrentChatId() : null;
-    // 如果刚好就是当前角色的当前聊天，直接 /chat-jump 跳过去
-    if (!jump.isGroup && curChar && curChar.avatar === jump.avatar && curChat === jump.file) {
+    if (typeof jump.swipeIdx !== 'number' && !jump.isGroup && curChar && curChar.avatar === jump.avatar && curChat === jump.file) {
         return jumpChat(jump.mesid);
     }
     return showChatFloorViewer(jump);
@@ -1784,20 +1899,29 @@ function showChatFloorViewer(jump) {
     const c = ctx();
     const text = `${jump.previewText || ''}`;
     const hlOpts = jump.stFold ? { ...kwLastOpts, stFold: true } : kwLastOpts;
-    const headTitle = jump.isGroup ? `[群] ${jump.groupName} · ${jump.file}` : `${jump.chName} · ${jump.file}`;
-    const canSwitch = (!jump.isGroup && typeof c.selectCharacterById === 'function')
+    const isSwipe = typeof jump.swipeIdx === 'number';
+    const swipeTag = isSwipe ? ` · Swipe ${jump.swipeIdx + 1}/${jump.swipeTotal}` : '';
+    const isLocalSwipe = jump.type === 'chatSwipe';
+    const headTitle = isLocalSwipe
+        ? (jump.file ? `${jump.file} · 历史 Swipe` : '当前聊天 · 历史 Swipe')
+        : (jump.isGroup ? `[群] ${jump.groupName} · ${jump.file}` : `${jump.chName} · ${jump.file}`);
+    const canSwitch = isLocalSwipe
+        || (!jump.isGroup && typeof c.selectCharacterById === 'function')
         || (jump.isGroup && typeof c.openGroupById === 'function');
+    const btnLabel = isLocalSwipe
+        ? (jump.file ? `打开此存档并跳转至 #${jump.mesid} 楼` : `跳转到 #${jump.mesid} 楼`)
+        : `切换到此聊天并跳转至 #${jump.mesid} 楼`;
 
     const html = `<div class="kwsearch-panel kwv-panel" data-theme="${esc(resolveTheme(getTheme()))}">
       <div class="kwsearch-glass">
         <div class="kwv-head">
           <span class="kwv-preset"><i class="fa-solid fa-comments"></i> ${esc(headTitle)}</span>
-          <span class="kwv-name">#${jump.mesid} ${esc(jump.who || '')}</span>
+          <span class="kwv-name">#${jump.mesid} ${esc(jump.who || '')}${esc(swipeTag)}</span>
           <button class="kwv-close" title="关闭"><i class="fa-solid fa-xmark"></i></button>
         </div>
         <div class="kwv-body">${text ? highlightHtml(text, kwLastQuery, hlOpts) : '<span class="kwv-empty">（该楼层无正文内容）</span>'}</div>
         ${canSwitch ? `<div class="kwv-actions">
-          <button class="kwv-switch"><i class="fa-solid fa-arrow-right-to-bracket"></i> 切换到此聊天并跳转至 #${jump.mesid} 楼</button>
+          <button class="kwv-switch"><i class="fa-solid fa-arrow-right-to-bracket"></i> ${esc(btnLabel)}</button>
         </div>` : ''}
       </div>
     </div>`;
@@ -1820,7 +1944,12 @@ function showChatFloorViewer(jump) {
         if (cl) cl.addEventListener('click', () => closePopup(cl), { once: true });
         if (sw) sw.addEventListener('click', async () => {
             closePopup(sw);
-            await switchAndJumpChatFloor(jump);
+            if (isLocalSwipe) {
+                if (jump.file) await jumpChatFile(jump.file, jump.mesid);
+                else await jumpChat(jump.mesid);
+            } else {
+                await switchAndJumpChatFloor(jump);
+            }
         }, { once: true });
     }, 60);
 }
@@ -3644,13 +3773,7 @@ function buildPanel(prefill) {
             }
         }
     }).catch(() => {});
-    if (prefill) {
-        input.value = prefill;
-    } else if (kwLastQuery) {
-        input.value = kwLastQuery;
-    } else if (last && last.query) {
-        input.value = last.query;
-    }
+    input.value = prefill || '';
     renderHistory(panel);
     if (!prefill && kwLastGroups) {
         renderResults(panel, kwLastGroups, kwLastQuery);
@@ -3870,7 +3993,12 @@ async function openModal(prefill) {
             try { panel.querySelector('.kws-input').focus(); } catch (e) { /* ignore */ }
             if (prefill) doSearch(panel);
         }, 50);
-        await promise;
+     try {
+         await promise;
+     } finally {
+         const inp = panel.querySelector('.kws-input');
+         if (inp) inp.value = '';
+     }
     } else {
         showFallback(panel);
         if (prefill) doSearch(panel);
