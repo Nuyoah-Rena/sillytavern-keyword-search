@@ -1846,26 +1846,188 @@ async function runChatJumpCommand(mesid) {
     return false;
 }
 
-async function jumpChat(mesid) {
-    const jumped = await runChatJumpCommand(mesid);
-    if (jumped) {
-        const el = await waitFor(() => document.querySelector(`.mes[mesid="${mesid}"]`), 2500, 60);
-        if (el) {
-            if (el.offsetParent !== null) {
-                const rect = el.getBoundingClientRect();
-                if (rect.bottom < 0 || rect.top > window.innerHeight) {
-                    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                }
-            }
-            flash(el);
+let kwChatHitTimer = null;
+
+function clearKwChatHitHighlight() {
+    clearTimeout(kwChatHitTimer);
+    kwChatHitTimer = null;
+    try {
+        if (typeof CSS !== 'undefined' && CSS.highlights) {
+            CSS.highlights.delete('kwsearch-chat-hit');
         }
+    } catch (e) { /* ignore */ }
+}
+
+function findChatScrollContainer(el) {
+    const chat = document.getElementById('chat');
+    if (chat && chat.contains(el) && chat.scrollHeight > chat.clientHeight + 2) return chat;
+    for (let node = el && el.parentElement; node && node !== document.body; node = node.parentElement) {
+        const oy = getComputedStyle(node).overflowY;
+        if ((oy === 'auto' || oy === 'scroll' || oy === 'overlay') && node.scrollHeight > node.clientHeight + 2) {
+            return node;
+        }
+    }
+    return null;
+}
+
+// 在目标楼层的渲染正文中定位第一个关键词并平滑居中滚动（不改动消息 DOM）
+function locateFirstKeywordInChatMes(mesEl, query, opts) {
+    if (!mesEl || !query) return false;
+    const root = mesEl.querySelector('.mes_text') || mesEl;
+    const useSt = Boolean(opts && opts.chatCaseST === false && typeof kwStConverter === 'function');
+    const effQuery = useSt ? kwStConverter(query) : query;
+
+    let re;
+    try { re = buildRegex(effQuery, opts || {}); } catch (e) { return false; }
+
+    const BLOCK_TAGS = new Set(['P', 'DIV', 'LI', 'BR', 'BLOCKQUOTE', 'PRE', 'TR', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'SECTION', 'ARTICLE', 'SUMMARY']);
+    const getBlockAncestor = (node) => {
+        for (let p = node.parentElement; p && p !== root; p = p.parentElement) {
+            if (BLOCK_TAGS.has(p.tagName)) return p;
+        }
+        return root;
+    };
+
+    const segs = [];
+    let buf = '', pos = 0, lastBlock = null;
+    const tw = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+        acceptNode(node) {
+            const p = node.parentElement;
+            if (!p) return NodeFilter.FILTER_REJECT;
+            if (p.closest('script, style, noscript')) return NodeFilter.FILTER_REJECT;
+            return node.nodeValue ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
+        },
+    });
+    let node;
+    while ((node = tw.nextNode())) {
+        const raw = node.nodeValue || '';
+        if (!raw) continue;
+        const blk = getBlockAncestor(node);
+        if (lastBlock && blk !== lastBlock) { buf += '\n'; pos += 1; }
+        lastBlock = blk;
+        const val = useSt ? kwStConverter(raw) : raw;
+        segs.push({ node, start: pos, end: pos + val.length, rawLen: raw.length, convLen: val.length });
+        buf += val;
+        pos += val.length;
+    }
+    if (!segs.length) return false;
+
+    const locatePt = (offset) => {
+        for (const s of segs) {
+            if (offset >= s.start && offset <= s.end) {
+                const rel = offset - s.start;
+                const mapped = (s.convLen === s.rawLen)
+                    ? rel
+                    : Math.round((rel / Math.max(1, s.convLen)) * s.rawLen);
+                return { node: s.node, offset: Math.max(0, Math.min(s.rawLen, mapped)) };
+            }
+        }
+        return null;
+    };
+
+    re.lastIndex = 0;
+    const hits = [];
+    let m, guard = 0;
+    while ((m = re.exec(buf)) !== null && hits.length < 25 && guard++ < 500) {
+        if (m[0].length === 0) { re.lastIndex++; continue; }
+        hits.push({ start: m.index, end: m.index + m[0].length });
+    }
+    if (!hits.length) return false;
+
+    const buildRange = (hit) => {
+        const a = locatePt(hit.start);
+        const b = locatePt(hit.end);
+        if (!a || !b) return null;
+        try {
+            const r = document.createRange();
+            r.setStart(a.node, a.offset);
+            r.setEnd(b.node, b.offset);
+            return r.collapsed ? null : r;
+        } catch (e) { return null; }
+    };
+
+    // 优先选已展开可见正文里的第一处；若全都在折叠的 <details> 内，则自动展开第一个
+    let targetRange = null;
+    let detailsFallback = null;
+    for (const hit of hits) {
+        const range = buildRange(hit);
+        if (!range) continue;
+        const p = range.startContainer.parentElement;
+        const closedDetails = p ? p.closest('details:not([open])') : null;
+        if (closedDetails) {
+            if (!detailsFallback) detailsFallback = { range, p };
+            continue;
+        }
+        const rect = range.getBoundingClientRect();
+        if (rect.width > 0 || rect.height > 0) {
+            targetRange = range;
+            break;
+        }
+    }
+
+    if (!targetRange && detailsFallback) {
+        let d = detailsFallback.p && detailsFallback.p.closest('details');
+        while (d && root.contains(d)) {
+            d.open = true;
+            d = d.parentElement && d.parentElement.closest('details');
+        }
+        targetRange = detailsFallback.range;
+    }
+    if (!targetRange) return false;
+
+    const rect = targetRange.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) return false;
+
+    const scroller = findChatScrollContainer(mesEl);
+    if (scroller) {
+        const sRect = scroller.getBoundingClientRect();
+        const targetTop = scroller.scrollTop + (rect.top - sRect.top) - (scroller.clientHeight / 2) + (rect.height / 2);
+        scroller.scrollTo({ top: Math.max(0, targetTop), behavior: 'smooth' });
+    } else {
+        window.scrollBy({ top: rect.top - window.innerHeight / 2 + rect.height / 2, behavior: 'smooth' });
+    }
+
+    clearKwChatHitHighlight();
+    if (typeof CSS !== 'undefined' && CSS.highlights && typeof Highlight === 'function') {
+        try {
+            const hl = new Highlight(targetRange);
+            hl.priority = 3;
+            CSS.highlights.set('kwsearch-chat-hit', hl);
+            kwChatHitTimer = setTimeout(clearKwChatHitHighlight, 5000);
+        } catch (e) { /* ignore */ }
+    } else if (targetRange.startContainer.parentElement) {
+        flash(targetRange.startContainer.parentElement);
+    }
+    return true;
+}
+
+async function jumpChat(mesid) {
+    ensureWiEnhanceStyle();
+    const jumped = await runChatJumpCommand(mesid);
+    let el = null;
+    if (jumped) {
+        el = await waitFor(() => document.querySelector(`.mes[mesid="${mesid}"]`), 2500, 60);
+    } else {
+        // 兜底：旧版酒馆无 /chat-jump 时沿用原逻辑
+        el = await ensureMessageRendered(mesid);
+    }
+    if (!el) {
+        if (!jumped) kwToast('没找到这条消息（可能已不在当前聊天）', 'warning');
         return;
     }
-    // 兜底：旧版酒馆无 /chat-jump 时沿用原逻辑
-    const el = await ensureMessageRendered(mesid);
-    if (!el) { kwToast('没找到这条消息（可能已不在当前聊天）', 'warning'); return; }
-    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    flash(el);
+
+    // 等 /chat-jump 自身滚动稳定后，再精准滚到该楼层的第一个关键词处
+    setTimeout(() => {
+        if (!el.isConnected) return;
+        const located = locateFirstKeywordInChatMes(el, kwLastQuery, kwLastOpts);
+        if (!located && el.offsetParent !== null) {
+            const rect = el.getBoundingClientRect();
+            if (!jumped || rect.bottom < 0 || rect.top > window.innerHeight) {
+                el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            }
+        }
+        flash(el);
+    }, jumped ? 220 : 80);
 }
 
 // 跳到该角色某个聊天存档的具体楼层（非当前存档先打开，再通过 /chat-jump 定位楼层）
@@ -2116,6 +2278,9 @@ function ensureWiEnhanceStyle() {
         }
         ::highlight(kwsearch-active) {
             background-color: #ff922b; color: #111111;
+        }
+        ::highlight(kwsearch-chat-hit) {
+            background-color: #ffe066; color: #181818;
         }
         .kwsearch-cm-hl-layer {
             position: absolute !important; pointer-events: none !important; overflow: hidden !important; z-index: 99 !important;
@@ -3743,23 +3908,13 @@ function buildPanel(prefill) {
         if (chip) { input.value = chip.dataset.q; doSearch(panel); }
     });
 
-    // 恢复上次搜索界面
-    const last = getLastState();
-    if (last) applyScopes(panel, last.scopes, last.opts);
-    // 若全局范围被勾选过，自动展开全局行
-    const gRow = panel.querySelector('.kwsearch-global');
-    const gToggle = panel.querySelector('.kws-more-scopes');
-    if (gRow && panel.querySelector('.kwsearch-global [data-scope]:checked')) {
-        gRow.hidden = false;
-        if (gToggle) gToggle.classList.add('on');
-    }
+    // 每次打开重置为默认界面（只保留「最近」搜索历史供手动清理）
     const regexRow = panel.querySelector('.kwsearch-regex-scopes');
     const regexToggle = panel.querySelector('.kws-more-regex');
     const syncRegexToggle = () => {
         regexToggle.classList.toggle('on', !regexRow.hidden);
         regexToggle.setAttribute('aria-expanded', String(!regexRow.hidden));
     };
-        // 默认关闭并折叠「正则脚本」
     regexRow.querySelectorAll('[data-scope]').forEach(cb => { cb.checked = false; });
     regexRow.hidden = true;
     regexToggle.addEventListener('click', () => { regexRow.hidden = !regexRow.hidden; syncRegexToggle(); });
@@ -3775,9 +3930,6 @@ function buildPanel(prefill) {
     }).catch(() => {});
     input.value = prefill || '';
     renderHistory(panel);
-    if (!prefill && kwLastGroups) {
-        renderResults(panel, kwLastGroups, kwLastQuery);
-    }
 
     // 配色色卡切换
     panel.querySelectorAll('.kws-dot').forEach(d => {
@@ -3843,7 +3995,7 @@ function buildPanel(prefill) {
     // 聊天按标签筛选 + 用户发言 + 区分简繁体（勾选当前聊天 / 全部聊天 / 当前角色卡时自动显示）
     const chatFilterRow = panel.querySelector('.kwsearch-chatfilter');
     if (chatFilterRow) {
-        panel._kwChatTags = (last && last.opts && Array.isArray(last.opts.chatTags)) ? [...last.opts.chatTags] : [];
+        panel._kwChatTags = [];
         let chatDelMode = false;
         const tagInp = chatFilterRow.querySelector('.kws-chat-tag-inp');
         const scanBtn = chatFilterRow.querySelector('.kws-chat-tag-scan');
@@ -3998,6 +4150,7 @@ async function openModal(prefill) {
      } finally {
          const inp = panel.querySelector('.kws-input');
          if (inp) inp.value = '';
+         kwLastGroups = null;
      }
     } else {
         showFallback(panel);
